@@ -1,4 +1,4 @@
-# s4db
+# s4db - Simple DB on S3
 
 A lightweight key-value store where keys and values are strings. Data is written to numbered binary files on disk and synced to S3. Values are Snappy-compressed. An in-memory index tracks the exact file and byte offset for every live key, so reads never scan - they seek directly.
 
