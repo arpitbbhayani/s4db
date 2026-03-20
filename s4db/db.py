@@ -1,7 +1,7 @@
 import glob as _glob
 import os
 
-from ._format import pack_file_header, pack_entry, unpack_entry_at, unpack_file_header, iter_file_entries, FLAG_TOMBSTONE, HEADER_SIZE
+from ._format import pack_file_header, pack_entry, unpack_entry_at, unpack_file_header, stream_file_entries, FLAG_TOMBSTONE, HEADER_SIZE
 from ._index import Index
 from ._storage import S3Storage
 from .compaction import compact as run_compaction
@@ -97,14 +97,13 @@ class S4DB:
 
         for path in data_files:
             with open(path, "rb") as fh:
-                data = fh.read()
-            _, file_num = unpack_file_header(data)
-            last_file_num = file_num
-            for offset, length, key, value, flags in iter_file_entries(data):
-                if flags == FLAG_TOMBSTONE:
-                    new_index.delete(key)
-                else:
-                    new_index.put(key, file_num, offset, length)
+                _, file_num = unpack_file_header(fh.read(HEADER_SIZE))
+                last_file_num = file_num
+                for offset, raw, key, flags in stream_file_entries(fh):
+                    if flags == FLAG_TOMBSTONE:
+                        new_index.delete(key)
+                    else:
+                        new_index.put(key, file_num, offset, len(raw))
 
         new_index.next_file_num = last_file_num + 1 if data_files else 1
         self._index = new_index

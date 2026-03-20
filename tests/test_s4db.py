@@ -1,4 +1,5 @@
 import glob as _glob
+import io
 import os
 import tempfile
 
@@ -12,7 +13,7 @@ from s4db._format import (
     unpack_file_header,
     pack_entry,
     unpack_entry_at,
-    iter_file_entries,
+    stream_file_entries,
     HEADER_SIZE,
     FLAG_NORMAL,
     FLAG_TOMBSTONE,
@@ -109,18 +110,17 @@ class TestEntry:
         assert len(packed) == expected
 
 
-class TestIterEntries:
+class TestStreamEntries:
     def test_iter_multiple(self):
         buf = bytearray(pack_file_header(1))
         pairs = [("a", "alpha"), ("b", "beta"), ("c", "gamma")]
         for k, v in pairs:
             buf += pack_entry(k, v)
-        data = bytes(buf)
-        results = list(iter_file_entries(data))
+        fh = io.BytesIO(bytes(buf))
+        results = list(stream_file_entries(fh))
         assert len(results) == 3
-        for i, (offset, length, key, value, flags) in enumerate(results):
+        for i, (offset, raw, key, flags) in enumerate(results):
             assert key == pairs[i][0]
-            assert value == pairs[i][1]
             assert flags == FLAG_NORMAL
 
 

@@ -65,10 +65,16 @@ def unpack_entry_at(data: bytes, offset: int = 0) -> tuple[str, str | None, int,
     return key, value, flags, entry_length
 
 
-def iter_file_entries(data: bytes):
-    offset = HEADER_SIZE
-    size = len(data)
-    while offset < size:
-        key, value, flags, entry_length = unpack_entry_at(data, offset)
-        yield offset, entry_length, key, value, flags
-        offset += entry_length
+def stream_file_entries(fh):
+    """Yield (offset, raw_bytes, key, flags) one entry at a time from a file handle."""
+    fh.seek(HEADER_SIZE)
+    while True:
+        offset = fh.tell()
+        header = fh.read(9)  # flags(1B) + key_len(4B) + value_len(4B)
+        if len(header) < 9:
+            break
+        flags, key_len, value_len = struct.unpack(">BLL", header)
+        rest = fh.read(key_len + value_len + 4)  # key + value + crc
+        raw = header + rest
+        key = raw[9 : 9 + key_len].decode("utf-8")
+        yield offset, raw, key, flags
