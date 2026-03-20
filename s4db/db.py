@@ -1,11 +1,12 @@
 import glob as _glob
 import os
 
-from ._format import pack_file_header, pack_entry, HEADER_SIZE
+from ._format import pack_file_header, pack_entry, unpack_entry_at, unpack_file_header, iter_file_entries, FLAG_TOMBSTONE, HEADER_SIZE
 from ._index import Index
 from ._storage import S3Storage
+from .compaction import compact as run_compaction
 
-_INDEX_FILENAME = "index.json"
+_INDEX_FILENAME = "index.idx"
 _DEFAULT_MAX_FILE_SIZE = 64 * 1024 * 1024  # 64 MB
 
 
@@ -31,41 +32,33 @@ class S4DB:
 
         os.makedirs(local_dir, exist_ok=True)
 
+        # Makes sure index is loaded in memory
+        # Be it from local or from S3
         local_index = os.path.join(local_dir, _INDEX_FILENAME)
         if os.path.exists(local_index):
             with open(local_index, "rb") as fh:
-                self._index = Index.from_json(fh.read())
+                self._index = Index.from_bytes(fh.read())
         elif self.storage.exists(_INDEX_FILENAME):
-            raw = self.storage.download_bytes(_INDEX_FILENAME)
-            self._index = Index.from_json(raw)
-
-    # ------------------------------------------------------------------
-    # Sync
-    # ------------------------------------------------------------------
+            self.storage.download_file(_INDEX_FILENAME, local_index)
+            with open(local_index, "rb") as fh:
+                self._index = Index.from_bytes(fh.read())
 
     def download(self) -> None:
         """Download all data files and the index from S3 into local_dir."""
         for filename in self.storage.list_data_files():
-            data = self.storage.download_bytes(filename)
-            with open(os.path.join(self.local_dir, filename), "wb") as fh:
-                fh.write(data)
-        if self.storage.exists(_INDEX_FILENAME):
-            raw = self.storage.download_bytes(_INDEX_FILENAME)
-            with open(os.path.join(self.local_dir, _INDEX_FILENAME), "wb") as fh:
-                fh.write(raw)
-            self._index = Index.from_json(raw)
+            self.storage.download_file(filename, os.path.join(self.local_dir, filename))
+
+        local_index = os.path.join(self.local_dir, _INDEX_FILENAME)
+        self.storage.download_file(_INDEX_FILENAME, local_index)
+        with open(local_index, "rb") as fh:
+            self._index = Index.from_bytes(fh.read())
 
     def upload(self) -> None:
         """Upload all local data files and the index to S3."""
         for path in sorted(_glob.glob(os.path.join(self.local_dir, "data_*.s4db"))):
             self.storage.upload(path, os.path.basename(path))
         local_index = os.path.join(self.local_dir, _INDEX_FILENAME)
-        if os.path.exists(local_index):
-            self.storage.upload(local_index, _INDEX_FILENAME)
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
+        self.storage.upload(local_index, _INDEX_FILENAME)
 
     def get(self, key: str) -> str | None:
         entry = self._index.get(key)
@@ -78,7 +71,6 @@ class S4DB:
                 raw = fh.read(entry.length)
         else:
             raw = self.storage.read_range(_data_filename(entry.file_num), entry.offset, entry.length)
-        from ._format import unpack_entry_at
         _, value, _, _ = unpack_entry_at(raw, 0)
         return value
 
@@ -96,11 +88,9 @@ class S4DB:
             self._write_entries(tombstones)
 
     def compact(self) -> None:
-        from .compaction import compact
-        compact(self)
+        run_compaction(self)
 
     def rebuild_index(self) -> None:
-        from ._format import unpack_file_header, iter_file_entries, FLAG_TOMBSTONE
         data_files = sorted(_glob.glob(os.path.join(self.local_dir, "data_*.s4db")))
         new_index = Index()
         last_file_num = 0
@@ -120,84 +110,55 @@ class S4DB:
         self._index = new_index
         self._save_index()
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _save_index(self) -> None:
-        data = self._index.to_json()
+        data = self._index.to_bytes()
         local_path = os.path.join(self.local_dir, _INDEX_FILENAME)
         with open(local_path, "wb") as fh:
             fh.write(data)
-        self.storage.upload_bytes(data, _INDEX_FILENAME)
 
     def _write_entries(self, entries: list[tuple[str, str | None, bool]]) -> None:
         # Resume writing into the latest file if it still has room, otherwise start a new one
         latest_file_num = self._index.next_file_num - 1
-        file_num = self._index.next_file_num
-        buf = bytearray(pack_file_header(file_num))
+        latest_path = os.path.join(self.local_dir, _data_filename(latest_file_num))
+        if latest_file_num >= 1 and os.path.exists(latest_path) and os.path.getsize(latest_path) < self.max_file_size:
+            file_num = latest_file_num
+            fh = open(latest_path, "ab")
+        else:
+            file_num = self._index.next_file_num
+            fh = open(os.path.join(self.local_dir, _data_filename(file_num)), "wb")
+            fh.write(pack_file_header(file_num))
 
-        if latest_file_num >= 1:
-            local_path = os.path.join(self.local_dir, _data_filename(latest_file_num))
-            if os.path.exists(local_path):
-                with open(local_path, "rb") as fh:
-                    existing_data = fh.read()
-                if len(existing_data) < self.max_file_size:
-                    file_num = latest_file_num
-                    buf = bytearray(existing_data)
-
-        state = {"file_num": file_num, "buf": buf}
-        # Tracks (key, file_num, offset, length) for non-tombstone entries
         written: list[tuple[str, int, int, int]] = []
 
-        def flush():
-            fn = state["file_num"]
-            data = bytes(state["buf"])
-            filename = _data_filename(fn)
-            local_path = os.path.join(self.local_dir, filename)
-            with open(local_path, "wb") as fh:
-                fh.write(data)
-            self.storage.upload(local_path, filename)
+        def roll():
+            nonlocal file_num, fh
+            fh.close()
+            file_num += 1
+            fh = open(os.path.join(self.local_dir, _data_filename(file_num)), "wb")
+            fh.write(pack_file_header(file_num))
 
-        for key, value, is_tombstone in entries:
-            packed = pack_entry(key, value, deleted=is_tombstone)
-            buf = state["buf"]
-
-            # Roll file only when current buffer has content beyond header
-            if len(buf) > HEADER_SIZE and len(buf) + len(packed) > self.max_file_size:
-                flush()
-                state["file_num"] += 1
-                state["buf"] = bytearray(pack_file_header(state["file_num"]))
-                buf = state["buf"]
-
-            entry_offset = len(buf)
-            buf += packed
-            state["buf"] = buf
-
-            if not is_tombstone:
-                written.append((key, state["file_num"], entry_offset, len(packed)))
-
-        # Flush final buffer
-        if len(state["buf"]) > HEADER_SIZE:
-            flush()
-
-        last_file_num = state["file_num"]
+        try:
+            for key, value, is_tombstone in entries:
+                packed = pack_entry(key, value, deleted=is_tombstone)
+                pos = fh.tell()
+                if pos > HEADER_SIZE and pos + len(packed) > self.max_file_size:
+                    roll()
+                offset = fh.tell()
+                fh.write(packed)
+                if not is_tombstone:
+                    written.append((key, file_num, offset, len(packed)))
+        finally:
+            fh.close()
 
         # Update in-memory index
-        for key, file_num, offset, length in written:
-            self._index.put(key, file_num, offset, length)
-
-        # Remove tombstoned keys from index
+        for key, fn, offset, length in written:
+            self._index.put(key, fn, offset, length)
         for key, value, is_tombstone in entries:
             if is_tombstone:
                 self._index.delete(key)
 
-        self._index.next_file_num = last_file_num + 1
+        self._index.next_file_num = file_num + 1
         self._save_index()
-
-    # ------------------------------------------------------------------
-    # Context manager
-    # ------------------------------------------------------------------
 
     def __enter__(self) -> "S4DB":
         return self

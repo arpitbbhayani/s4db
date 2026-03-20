@@ -22,6 +22,9 @@ class S3Storage:
     def upload_bytes(self, data: bytes, filename: str) -> None:
         self._client.put_object(Bucket=self.bucket, Key=self._key(filename), Body=data)
 
+    def download_file(self, filename: str, local_path: str) -> None:
+        self._client.download_file(self.bucket, self._key(filename), local_path)
+
     def download_bytes(self, filename: str) -> bytes:
         response = self._client.get_object(Bucket=self.bucket, Key=self._key(filename))
         return response["Body"].read()

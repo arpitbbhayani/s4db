@@ -1,3 +1,4 @@
+import glob as _glob
 import os
 import tempfile
 
@@ -143,13 +144,13 @@ class TestIndex:
         idx.delete("k1")
         assert idx.get("k1") is None
 
-    def test_json_roundtrip(self):
+    def test_bytes_roundtrip(self):
         idx = Index()
         idx.next_file_num = 5
         idx.put("a", 2, 9, 30)
         idx.put("b", 3, 40, 25)
-        raw = idx.to_json()
-        idx2 = Index.from_json(raw)
+        raw = idx.to_bytes()
+        idx2 = Index.from_bytes(raw)
         assert idx2.next_file_num == 5
         assert idx2.get("a") == IndexEntry(file_num=2, offset=9, length=30)
         assert idx2.get("b") == IndexEntry(file_num=3, offset=40, length=25)
@@ -215,7 +216,7 @@ class TestDelete:
     def test_delete_nonexistent_key_is_noop(self, db):
         # Should not raise, should not write tombstone
         db.delete(["ghost"])
-        files = db.storage.list_data_files()
+        files = _glob.glob(os.path.join(db.local_dir, "data_*.s4db"))
         assert files == []
 
     def test_delete_multiple(self, db):
@@ -240,7 +241,7 @@ class TestFileRolling:
             region_name="us-east-1",
         )
         db.put({"k1": "v" * 50, "k2": "v" * 50, "k3": "v" * 50})
-        files = db.storage.list_data_files()
+        files = sorted(_glob.glob(os.path.join(db.local_dir, "data_*.s4db")))
         assert len(files) > 1
         # All keys still readable
         assert db.get("k1") == "v" * 50
@@ -256,21 +257,19 @@ class TestFileRolling:
             region_name="us-east-1",
         )
         db.put({"k": "v"})
-        files = db.storage.list_data_files()
+        files = sorted(_glob.glob(os.path.join(db.local_dir, "data_*.s4db")))
         for f in files:
-            data = db.storage.download_bytes(f)
-            assert len(data) > HEADER_SIZE
+            assert os.path.getsize(f) > HEADER_SIZE
 
 
 class TestCompaction:
     def test_compact_removes_old_files(self, db):
         db.put({"a": "1", "b": "2"})
         db.put({"a": "updated"})
-        old_files = db.storage.list_data_files()
+        old_files = sorted(_glob.glob(os.path.join(db.local_dir, "data_*.s4db")))
         assert len(old_files) >= 1
         db.compact()
-        new_files = db.storage.list_data_files()
-        # All old files should be gone
+        new_files = sorted(_glob.glob(os.path.join(db.local_dir, "data_*.s4db")))
         for f in old_files:
             assert f not in new_files
 
@@ -288,7 +287,7 @@ class TestCompaction:
         db.compact()
         assert db.get("x") is None
         # After compaction there should be no data files (all tombstoned)
-        files = db.storage.list_data_files()
+        files = _glob.glob(os.path.join(db.local_dir, "data_*.s4db"))
         assert files == []
 
     def test_compact_preserves_all_live_keys(self, db):
@@ -331,10 +330,11 @@ class TestContextManager:
 
 
 class TestIndexPersistence:
-    def test_index_persisted_after_put(self, db, s3):
+    def test_index_persisted_after_put(self, db):
         db.put({"persist": "me"})
-        raw = s3.get_object(Bucket=BUCKET, Key=PREFIX + "index.json")["Body"].read()
-        idx = Index.from_json(raw)
+        local_index = os.path.join(db.local_dir, "index.idx")
+        with open(local_index, "rb") as fh:
+            idx = Index.from_bytes(fh.read())
         assert idx.get("persist") is not None
 
     def test_next_file_num_increments(self, db):
