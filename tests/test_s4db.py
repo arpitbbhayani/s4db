@@ -575,3 +575,169 @@ class TestKeys:
     def test_returns_list_type(self, db):
         db.put({"x": "y"})
         assert isinstance(db.keys(), list)
+
+
+# ---------------------------------------------------------------------------
+# iter() tests
+# ---------------------------------------------------------------------------
+
+
+class TestIter:
+    """Tests for the iter() API (local=False, S3 range reads per key)."""
+
+    def test_empty_db_yields_nothing(self, db):
+        assert list(db.iter()) == []
+
+    def test_yields_all_kv_pairs(self, db):
+        data = {"a": "1", "b": "2", "c": "3"}
+        db.put(data)
+        result = dict(db.iter())
+        assert result == data
+
+    def test_deleted_keys_not_yielded(self, db):
+        db.put({"a": "1", "b": "2"})
+        db.delete(["a"])
+        result = dict(db.iter())
+        assert result == {"b": "2"}
+
+    def test_overwritten_key_yields_latest_value(self, db):
+        db.put({"k": "old"})
+        db.put({"k": "new"})
+        result = dict(db.iter())
+        assert result == {"k": "new"}
+
+    def test_yields_tuples(self, db):
+        db.put({"x": "y"})
+        pairs = list(db.iter())
+        assert len(pairs) == 1
+        key, value = pairs[0]
+        assert key == "x"
+        assert value == "y"
+
+    def test_is_a_generator(self, db):
+        import types
+        db.put({"a": "1"})
+        result = db.iter()
+        assert isinstance(result, types.GeneratorType)
+
+    def test_uses_s3_range_read_without_local_files(self, db, tmp_path):
+        """iter(local=False) reads from S3 when local data files are absent."""
+        db.put({"remote": "value"})
+        db.upload()
+
+        fresh_dir = tmp_path / "fresh"
+        fresh_dir.mkdir()
+        db2 = S4DB(local_dir=str(fresh_dir), bucket=BUCKET, prefix=PREFIX, region_name="us-east-1")
+        # No data files locally
+        assert _glob.glob(os.path.join(str(fresh_dir), "data_*.s4db")) == []
+        result = dict(db2.iter())
+        assert result == {"remote": "value"}
+
+    def test_multiple_files_all_keys_yielded(self, s3, tmp_path):
+        """iter() works when keys span multiple data files."""
+        db = S4DB(
+            local_dir=str(tmp_path),
+            bucket=BUCKET,
+            prefix=PREFIX,
+            max_file_size=29,
+            region_name="us-east-1",
+        )
+        data = {"k1": "v" * 50, "k2": "v" * 50, "k3": "v" * 50}
+        db.put(data)
+        # Confirm multiple files were written
+        files = sorted(_glob.glob(os.path.join(str(tmp_path), "data_*.s4db")))
+        assert len(files) > 1
+        result = dict(db.iter())
+        assert result == data
+
+
+class TestIterLocal:
+    """Tests for iter(local=True) - downloads files then reads from disk."""
+
+    def test_empty_db_yields_nothing(self, db):
+        assert list(db.iter(local=True)) == []
+
+    def test_yields_all_kv_pairs(self, db):
+        data = {"a": "1", "b": "2", "c": "3"}
+        db.put(data)
+        result = dict(db.iter(local=True))
+        assert result == data
+
+    def test_deleted_keys_not_yielded(self, db):
+        db.put({"a": "1", "b": "2"})
+        db.delete(["a"])
+        result = dict(db.iter(local=True))
+        assert result == {"b": "2"}
+
+    def test_overwritten_key_yields_latest_value(self, db):
+        db.put({"k": "old"})
+        db.put({"k": "new"})
+        result = dict(db.iter(local=True))
+        assert result == {"k": "new"}
+
+    def test_downloads_missing_files_from_s3(self, db, tmp_path):
+        """iter(local=True) downloads missing data files before iterating."""
+        db.put({"hello": "world"})
+        db.upload()
+
+        fresh_dir = tmp_path / "fresh"
+        fresh_dir.mkdir()
+        db2 = S4DB(local_dir=str(fresh_dir), bucket=BUCKET, prefix=PREFIX, region_name="us-east-1")
+        # No data files locally yet
+        assert _glob.glob(os.path.join(str(fresh_dir), "data_*.s4db")) == []
+        result = dict(db2.iter(local=True))
+        # Files are now downloaded
+        assert len(_glob.glob(os.path.join(str(fresh_dir), "data_*.s4db"))) > 0
+        assert result == {"hello": "world"}
+
+    def test_does_not_replace_existing_local_files(self, db, tmp_path):
+        """iter(local=True) leaves existing local files intact."""
+        db.put({"k": "v"})
+        db.upload()
+
+        fresh_dir = tmp_path / "fresh"
+        fresh_dir.mkdir()
+        db2 = S4DB(local_dir=str(fresh_dir), bucket=BUCKET, prefix=PREFIX, region_name="us-east-1")
+        # Pre-populate the local file with db2's data (simulate already-present file)
+        db2.iter(local=True)  # first call downloads the file
+        data_files = _glob.glob(os.path.join(str(fresh_dir), "data_*.s4db"))
+        assert len(data_files) == 1
+        mtime_before = os.path.getmtime(data_files[0])
+
+        # Second call should not overwrite the file
+        list(db2.iter(local=True))
+        mtime_after = os.path.getmtime(data_files[0])
+        assert mtime_before == mtime_after
+
+    def test_multiple_files_all_keys_yielded(self, s3, tmp_path):
+        """iter(local=True) works when keys span multiple data files."""
+        db = S4DB(
+            local_dir=str(tmp_path),
+            bucket=BUCKET,
+            prefix=PREFIX,
+            max_file_size=29,
+            region_name="us-east-1",
+        )
+        data = {"k1": "v" * 50, "k2": "v" * 50, "k3": "v" * 50}
+        db.put(data)
+        files = sorted(_glob.glob(os.path.join(str(tmp_path), "data_*.s4db")))
+        assert len(files) > 1
+        result = dict(db.iter(local=True))
+        assert result == data
+
+    def test_downloads_only_files_referenced_by_index(self, db, tmp_path):
+        """iter(local=True) only downloads files needed for live keys, not all S3 files."""
+        data1 = {"a": "1", "b": "2"}
+        db.put(data1)
+        db.upload()
+
+        # Overwrite one key - creates a second data file
+        db.put({"a": "updated"})
+        db.upload()
+
+        fresh_dir = tmp_path / "fresh"
+        fresh_dir.mkdir()
+        db2 = S4DB(local_dir=str(fresh_dir), bucket=BUCKET, prefix=PREFIX, region_name="us-east-1")
+        result = dict(db2.iter(local=True))
+        assert result["a"] == "updated"
+        assert result["b"] == "2"

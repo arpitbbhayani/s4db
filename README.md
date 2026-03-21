@@ -93,6 +93,34 @@ all_keys = db.keys()
 - Only returns keys that are live (not deleted). Tombstoned keys are never included.
 - The order of the returned list is not guaranteed.
 
+### `iter(local=False) -> Generator[tuple[str, str], ...]`
+
+Yields `(key, value)` pairs for every live key in the database.
+
+```python
+for key, value in db.iter():
+    print(key, value)
+```
+
+The `local` parameter controls how values are read:
+
+- **`local=False` (default)** - for each key, calls `get()` which fetches only that entry's bytes from S3 using a range request. No files are downloaded. Use this for sparse access or when disk space is limited.
+- **`local=True`** - before iteration, downloads all data files referenced by the index that are not already present in `local_dir`. Existing local files are **not** replaced. Values are then read from disk - no S3 calls during iteration itself. Use this when iterating over many keys to avoid one S3 request per key.
+
+```python
+# S3 range request per key (default)
+for key, value in db.iter():
+    process(key, value)
+
+# Download missing files first, then read from disk
+for key, value in db.iter(local=True):
+    process(key, value)
+```
+
+- Deleted keys are never yielded.
+- The iteration order is not guaranteed.
+- `iter(local=True)` creates `local_dir` (or a temp dir) if none was provided.
+
 ### `delete(keys: list[str]) -> None`
 
 Writes tombstone entries for each key that exists in the index.
@@ -231,6 +259,20 @@ db.download()   # pull everything local
 print(db.get("some-key"))   # served from disk, no S3 call
 ```
 
+### Iterate over all key/value pairs
+
+```python
+# One S3 range request per key (no local files needed)
+db = S4DB("my-bucket", "my-db/")
+for key, value in db.iter():
+    print(key, value)
+
+# Download missing files first, then read entirely from disk
+db = S4DB("my-bucket", "my-db/", local_dir="/tmp/my-db")
+for key, value in db.iter(local=True):
+    print(key, value)
+```
+
 ### Periodic compaction
 
 ```python
@@ -257,6 +299,8 @@ db.upload()         # push repaired index to S3
 - `delete()` silently skips keys that are not in the index. It never writes unnecessary tombstones.
 - If the process is interrupted during `put()` or `delete()`, the data file may contain entries that the index does not reference. `rebuild_index()` will recover them.
 - `max_file_size` is a soft limit. An entry is never split across files, but a single oversized entry can make a file exceed the limit slightly.
+- `iter(local=False)` makes one S3 range request per key. For large datasets prefer `iter(local=True)` to batch the S3 downloads upfront.
+- `iter(local=True)` only downloads files referenced by the current in-memory index. Files that contain only deleted or overwritten entries are not downloaded.
 
 ## Dependencies
 
