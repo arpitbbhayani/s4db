@@ -120,6 +120,44 @@ class S4DB:
         """Returns a list of all live keys in the database."""
         return list(self._index.entries.keys())
 
+    def iter(self, local: bool = False):
+        """Yields (key, value) pairs for every live key in the database.
+
+        Iterates over the index and yields each key with its value.
+
+        If local is False (default), each value is fetched via get(), which uses
+        an S3 range request for files not present locally - one S3 call per key.
+
+        If local is True, all data files referenced by the index are downloaded
+        from S3 into local_dir before iteration begins. Files already present
+        locally are not replaced. Values are then read from disk - no S3 calls
+        during the iteration itself.
+
+        Use local=True when you need to iterate over many keys and want to avoid
+        a separate S3 request per key.
+        """
+        if local:
+            local_dir = self._get_local_dir()
+            # Download only files referenced by the index that are not already local
+            needed = {_data_filename(e.file_num) for e in self._index.entries.values()}
+            for filename in needed:
+                local_path = os.path.join(local_dir, filename)
+                if not os.path.exists(local_path):
+                    self.storage.download_file(filename, local_path)
+            # Read values from disk and yield
+            for key, entry in self._index.entries.items():
+                local_path = os.path.join(local_dir, _data_filename(entry.file_num))
+                with open(local_path, "rb") as fh:
+                    fh.seek(entry.offset)
+                    raw = fh.read(entry.length)
+                _, value, _, _ = unpack_entry_at(raw, 0)
+                yield key, value
+        else:
+            for key in self._index.entries:
+                value = self.get(key)
+                if value is not None:
+                    yield key, value
+
     def flush(self) -> None:
         """Flushes the in-memory index to disk."""
         self._save_index()
