@@ -26,8 +26,8 @@ class S4DB:
     ):
         """Opens (or creates) an S4DB database backed by local_dir and an S3 bucket.
 
-        On init the index is loaded from local_dir if present; otherwise it is fetched
-        from S3 and cached locally. If neither exists the database starts empty.
+        On init the index is fetched from S3 into memory; if it does not exist the
+        database starts empty. The index is never read from a local file on startup.
         max_file_size controls when data files are rolled over (default 64 MB).
         Extra boto_kwargs are forwarded to the S3 client.
         """
@@ -40,34 +40,22 @@ class S4DB:
 
         os.makedirs(local_dir, exist_ok=True)
 
-        # Makes sure index is loaded in memory
-        # Be it from local or from S3
-        local_index = os.path.join(local_dir, _INDEX_FILENAME)
-        if os.path.exists(local_index):
-            with open(local_index, "rb") as fh:
-                self._index = Index.from_bytes(fh.read())
-        elif self.storage.exists(_INDEX_FILENAME):
-            self.storage.download_file(_INDEX_FILENAME, local_index)
-            with open(local_index, "rb") as fh:
-                self._index = Index.from_bytes(fh.read())
+        # Load index from S3 into memory only — no local file caching on init
+        if self.storage.exists(_INDEX_FILENAME):
+            self._index = Index.from_bytes(self.storage.download_bytes(_INDEX_FILENAME))
 
     def download(self) -> None:
         """Download all data files and the index from S3 into local_dir."""
         for filename in self.storage.list_data_files():
             self.storage.download_file(filename, os.path.join(self.local_dir, filename))
 
-        local_index = os.path.join(self.local_dir, _INDEX_FILENAME)
-        self.storage.download_file(_INDEX_FILENAME, local_index)
-        with open(local_index, "rb") as fh:
-            self._index = Index.from_bytes(fh.read())
+        self._index = Index.from_bytes(self.storage.download_bytes(_INDEX_FILENAME))
 
     def upload(self) -> None:
         """Upload all local data files and the index to S3."""
         for path in sorted(_glob.glob(os.path.join(self.local_dir, "data_*.s4db"))):
             self.storage.upload(path, os.path.basename(path))
-        self.flush()
-        local_index = os.path.join(self.local_dir, _INDEX_FILENAME)
-        self.storage.upload(local_index, _INDEX_FILENAME)
+        self.storage.upload_bytes(self._index.to_bytes(), _INDEX_FILENAME)
 
     def get(self, key: str) -> str | None:
         """Returns the value for key, or None if it does not exist or has been deleted.
