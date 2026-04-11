@@ -302,6 +302,96 @@ db.upload()         # push repaired index to S3
 - `iter(local=False)` makes one S3 range request per key. For large datasets prefer `iter(local=True)` to batch the S3 downloads upfront.
 - `iter(local=True)` only downloads files referenced by the current in-memory index. Files that contain only deleted or overwritten entries are not downloaded.
 
+## Benchmarks
+
+Run the suite yourself (no AWS credentials required — uses moto):
+
+```bash
+python benchmarks/bench.py
+```
+
+All numbers below are from moto (in-process S3 mock). Real S3 adds 5–50 ms of
+network RTT on top of the mocked figures; the relative rankings and request-count
+comparisons are unaffected.
+
+### 1. Write throughput — batched vs unbatched
+
+2 000 key/value pairs, ~256 B values, one `upload()` at the end.
+
+| Scenario | Throughput | Elapsed |
+|---|---|---|
+| `put(100 keys)` × 20 + `upload()` | ~36 000 keys/sec | ~56 ms |
+| `put(1 key)` × 2 000 + `upload()` | ~1 900 keys/sec | ~1 070 ms |
+| **Batched speedup** | **~19×** | |
+
+Each unbatched `put()` appends to the data file and rewrites the index file to
+disk. That per-call overhead dominates. A single `put()` with all keys amortizes
+both costs to near zero per key.
+
+### 2. Read latency — S3 range request vs local disk
+
+1 000 keys pre-loaded, 500 `get()` trials, Zipf-like hot/cold distribution
+(top 20% of keys receive 80% of reads).
+
+| Metric | S3 range request | Local disk | Speedup |
+|---|---|---|---|
+| mean | 1.64 ms | 0.011 ms | ~143× |
+| median | 1.38 ms | 0.010 ms | ~144× |
+| p95 | 2.99 ms | 0.013 ms | ~231× |
+| p99 | 6.72 ms | 0.052 ms | ~128× |
+
+Hot and cold keys show identical local-disk latency (~0.01 ms) — the in-memory
+index stores the exact file number and byte offset, so every read is a direct seek
+with no scanning.
+
+### 3. s4db vs Naive S3 (one object per key)
+
+The straw-man baseline: each key is a separate S3 object, written with
+`put_object` and read with `get_object`. 2 000 writes + 500 reads on a 1 000-key
+corpus.
+
+| Metric | Naive S3 | s4db (batched) | s4db wins |
+|---|---|---|---|
+| Write throughput | ~700 keys/sec | ~63 000 keys/sec | **~89×** |
+| S3 PUT requests | 2 000 | 2 | **1 000× fewer** |
+| S3 GET requests | 500 | 500 | equal |
+| Read mean latency | 1.59 ms | 1.47 ms | ~1.1× |
+| Estimated API cost | $0.010200 | $0.000210 | **~49× cheaper** |
+
+Cost is dominated by the 2 000 PUT requests naive S3 issues ($0.005/1 000 PUTs).
+s4db collapses that to 2 S3 calls regardless of how many keys are written — one
+data-file upload and one index upload — so the per-key API cost is essentially
+zero at scale. Read-request counts are equal because both approaches make one S3
+GET per `get()` call; the difference is that s4db fetches only the exact bytes for
+that entry (range request) rather than the full object.
+
+> Pricing basis: AWS S3 Standard us-east-1 — PUT $0.005/1 000 requests,
+> GET $0.0004/1 000 requests (2025).
+
+### 4. The S3 tax — local Bitcask vs s4db
+
+To quantify what S3 costs in latency terms, s4db's two read paths are compared
+against a minimal local Bitcask (same append-only-log + in-memory-index design,
+pure disk, no S3). 1 000 keys pre-loaded, 500 `get()` trials.
+
+| Metric | Local Bitcask | s4db local disk | s4db S3 range |
+|---|---|---|---|
+| mean | 0.002 ms | 0.013 ms | 1.48 ms |
+| median | 0.002 ms | 0.010 ms | 1.28 ms |
+| p95 | 0.002 ms | 0.014 ms | 2.38 ms |
+| p99 | 0.004 ms | 0.064 ms | 5.76 ms |
+
+**s4db's local disk path is ~8× slower than a bare Bitcask.** The gap comes from
+Snappy decompression and the s4db entry-format parse on top of an otherwise
+identical seek. No S3 is involved.
+
+**S3 range requests (mocked) add another ~115× on top of local disk reads.**
+On real S3 that gap will be larger — a typical range-request RTT is 5–50 ms,
+versus ~0.01 ms for a local seek. The trade-off is explicit and intentional: s4db
+is designed for durable, serverless workloads where there is no local disk. When
+a local directory *is* available, `download()` + local reads bring latency back
+to the local-disk column.
+
 ## Dependencies
 
 - [boto3](https://github.com/boto/boto3) >= 1.26
