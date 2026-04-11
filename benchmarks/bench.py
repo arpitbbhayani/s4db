@@ -638,6 +638,221 @@ def bench_s3_tax():
 
 
 # ---------------------------------------------------------------------------
+# Workload A – Bulk write throughput as a function of batch size
+# ---------------------------------------------------------------------------
+
+WA_TOTAL_KEYS  = 100_000
+WA_VALUE_SIZE  = 256
+# batch_size=1 is excluded: each put(1) flushes the whole index to disk,
+# making it O(n²) at 100k scale (minutes vs seconds for larger batches).
+WA_BATCH_SIZES = [100, 1_000, 10_000]
+
+
+def bench_workload_a():
+    print(_separator("="))
+    print("WORKLOAD A — Bulk Write Throughput  (batch size sweep)")
+    print(f"  {WA_TOTAL_KEYS:,} key/value pairs, value size {WA_VALUE_SIZE} B")
+    print(f"  Batch sizes tested: {WA_BATCH_SIZES}")
+    print(f"  Pattern: put(batch) × (total/batch) then one upload()")
+    print(_separator())
+
+    data_all = {_rand_str(KEY_SIZE): _rand_str(WA_VALUE_SIZE) for _ in range(WA_TOTAL_KEYS)}
+    keys_list = list(data_all.keys())
+
+    results = {}
+    for batch_size in WA_BATCH_SIZES:
+        with mock_aws():
+            _setup_aws_env()
+            boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+                proxy = _inject_counter(db)
+                batches = [
+                    {k: data_all[k] for k in keys_list[i: i + batch_size]}
+                    for i in range(0, WA_TOTAL_KEYS, batch_size)
+                ]
+                t0 = time.perf_counter()
+                for batch in batches:
+                    db.put(batch)
+                db.upload()
+                elapsed = time.perf_counter() - t0
+                s3_puts = proxy.total_puts
+
+        tput = WA_TOTAL_KEYS / elapsed
+        results[batch_size] = {"elapsed_ms": elapsed * 1000, "keys_per_sec": tput, "s3_puts": s3_puts}
+
+    header = f"  {'Batch size':>12}  {'keys/sec':>12}  {'elapsed (ms)':>14}  {'S3 PUTs':>10}  {'Speedup':>9}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    baseline = results[WA_BATCH_SIZES[0]]["elapsed_ms"]
+    for bs in WA_BATCH_SIZES:
+        r = results[bs]
+        speedup = baseline / r["elapsed_ms"]
+        print(f"  {bs:>12,}  {r['keys_per_sec']:>12,.0f}  {r['elapsed_ms']:>13,.1f}ms"
+              f"  {r['s3_puts']:>10,}  {speedup:>8.1f}x")
+    print()
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Workload B – Point read latency: cold (S3 range) vs warm (local after download)
+# ---------------------------------------------------------------------------
+
+WB_SETUP_KEYS = 100_000
+WB_VALUE_SIZE = 256
+WB_TRIALS     = 500
+
+
+def bench_workload_b():
+    print(_separator("="))
+    print("WORKLOAD B — Point Read Latency  (cold S3 range vs warm local disk)")
+    print(f"  {WB_SETUP_KEYS:,} keys pre-loaded, {WB_TRIALS} get() trials")
+    print(f"  Cold : no local files — each get() issues an S3 range request")
+    print(f"  Warm : download() called first — reads served from local disk")
+    print(_separator())
+
+    data = {_rand_str(KEY_SIZE): _rand_str(WB_VALUE_SIZE) for _ in range(WB_SETUP_KEYS)}
+    keys_list = list(data.keys())
+    trial_keys = random.choices(keys_list, k=WB_TRIALS)
+
+    cold_lats: list[float] = []
+    warm_lats: list[float] = []
+
+    # ---- Cold: S3 range requests (no local dir) ----
+    with mock_aws():
+        _setup_aws_env()
+        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_w = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+            # Write in large batches to keep setup fast
+            for i in range(0, WB_SETUP_KEYS, 10_000):
+                db_w.put({k: data[k] for k in keys_list[i: i + 10_000]})
+            db_w.upload()
+
+            db_cold = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
+            for key in trial_keys:
+                t0 = time.perf_counter()
+                db_cold.get(key)
+                cold_lats.append((time.perf_counter() - t0) * 1_000)
+
+    # ---- Warm: download() then local disk reads ----
+    with mock_aws():
+        _setup_aws_env()
+        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
+        with tempfile.TemporaryDirectory() as write_dir:
+            db_w = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=write_dir, region_name=REGION)
+            for i in range(0, WB_SETUP_KEYS, 10_000):
+                db_w.put({k: data[k] for k in keys_list[i: i + 10_000]})
+            db_w.upload()
+
+            with tempfile.TemporaryDirectory() as read_dir:
+                db_warm = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=read_dir, region_name=REGION)
+                db_warm.download()   # pull all data files locally
+                for key in trial_keys:
+                    t0 = time.perf_counter()
+                    db_warm.get(key)
+                    warm_lats.append((time.perf_counter() - t0) * 1_000)
+
+    cold_stats = _stats(cold_lats)
+    warm_stats = _stats(warm_lats)
+
+    header = f"  {'Metric':<10}  {'Cold (S3 range)':>16}  {'Warm (local disk)':>18}  {'Speedup':>10}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for metric in ("mean", "median", "p95", "p99", "min", "max"):
+        cv = cold_stats[metric]
+        wv = warm_stats[metric]
+        speedup = cv / wv if wv > 0 else float("inf")
+        print(f"  {metric:<10}  {cv:>15.3f}ms  {wv:>17.3f}ms  {speedup:>9.1f}x")
+    print()
+    return {"cold": cold_stats, "warm": warm_stats}
+
+
+# ---------------------------------------------------------------------------
+# Workload C – Mixed read/write (80/20 split, 100k key space)
+# ---------------------------------------------------------------------------
+
+WC_KEY_SPACE     = 100_000
+WC_VALUE_SIZE    = 256
+WC_OPERATIONS    = 10_000
+WC_READ_FRACTION = 0.80
+
+
+def bench_workload_c():
+    print(_separator("="))
+    print("WORKLOAD C — Mixed Read/Write  (realistic Lambda invocation pattern)")
+    print(f"  {WC_KEY_SPACE:,} key space, {WC_OPERATIONS:,} operations")
+    print(f"  Mix: {int(WC_READ_FRACTION*100)}% reads / {int((1-WC_READ_FRACTION)*100)}% writes")
+    print(f"  Upload() called once at the end (end-of-invocation flush pattern)")
+    print(_separator())
+
+    # Pre-populate the key space
+    all_keys = [_rand_str(KEY_SIZE) for _ in range(WC_KEY_SPACE)]
+    initial_data = {k: _rand_str(WC_VALUE_SIZE) for k in all_keys}
+
+    # Build the operation sequence: 80% reads, 20% writes
+    n_reads  = int(WC_OPERATIONS * WC_READ_FRACTION)
+    n_writes = WC_OPERATIONS - n_reads
+    read_ops  = [("get",  random.choice(all_keys)) for _ in range(n_reads)]
+    write_ops = [("put",  random.choice(all_keys)) for _ in range(n_writes)]
+    ops = read_ops + write_ops
+    random.shuffle(ops)
+
+    read_lats:  list[float] = []
+    write_lats: list[float] = []
+    total_start = 0.0
+    total_end   = 0.0
+
+    with mock_aws():
+        _setup_aws_env()
+        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Seed the database
+            db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+            for i in range(0, WC_KEY_SPACE, 10_000):
+                db.put({k: initial_data[k] for k in all_keys[i: i + 10_000]})
+            db.upload()
+
+            # Re-open (simulates a fresh Lambda invocation loading from S3)
+            db2 = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+            proxy = _inject_counter(db2)
+
+            total_start = time.perf_counter()
+            for op, key in ops:
+                t0 = time.perf_counter()
+                if op == "get":
+                    db2.get(key)
+                    read_lats.append((time.perf_counter() - t0) * 1_000)
+                else:
+                    db2.put({key: _rand_str(WC_VALUE_SIZE)})
+                    write_lats.append((time.perf_counter() - t0) * 1_000)
+            db2.upload()
+            total_end = time.perf_counter()
+            s3_calls = dict(proxy.calls)
+
+    total_elapsed = total_end - total_start
+    total_ops     = len(ops)
+    ops_per_sec   = total_ops / total_elapsed
+
+    read_st  = _stats(read_lats)
+    write_st = _stats(write_lats)
+
+    print(f"  Total ops      : {total_ops:,}  ({n_reads:,} reads + {n_writes:,} writes)")
+    print(f"  Elapsed        : {total_elapsed*1000:,.1f} ms")
+    print(f"  Throughput     : {ops_per_sec:,.0f} ops/sec")
+    print(f"  S3 API calls   : {s3_calls}")
+    print()
+
+    header = f"  {'Metric':<10}  {'Read latency':>14}  {'Write latency':>14}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for metric in ("mean", "median", "p95", "p99"):
+        print(f"  {metric:<10}  {read_st[metric]:>13.3f}ms  {write_st[metric]:>13.3f}ms")
+    print()
+    return {"reads": read_st, "writes": write_st, "ops_per_sec": ops_per_sec}
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -659,6 +874,14 @@ if __name__ == "__main__":
     bench_read_latency()
     bench_vs_naive()
     bench_s3_tax()
+
+    print()
+    print("=" * 60)
+    print("EXTENDED WORKLOADS  (100k key space)")
+    print("=" * 60)
+    bench_workload_a()
+    bench_workload_b()
+    bench_workload_c()
 
     print(_separator("="))
     print("Done.")
