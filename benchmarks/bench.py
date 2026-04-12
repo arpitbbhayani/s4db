@@ -11,7 +11,7 @@ Measures four things:
   4. S3 tax            -- local Bitcask vs s4db (S3 range) vs s4db (local disk),
                          to quantify the latency overhead introduced by S3
 
-Uses moto to mock S3, so no real AWS credentials are required.
+Requires real AWS credentials and an S3 bucket (set BUCKET / PREFIX / REGION below).
 Run with:
     python benchmarks/bench.py
 """
@@ -27,7 +27,6 @@ import time
 from collections import defaultdict
 
 import boto3
-from moto import mock_aws
 
 from s4db import S4DB
 
@@ -37,7 +36,7 @@ from s4db import S4DB
 
 BUCKET = "bench-bucket"
 PREFIX = "bench/"
-REGION = "us-east-1"
+REGION = "ap-east-1"
 
 # Write benchmark
 WRITE_TOTAL_KEYS = 2_000       # total key/value pairs written per scenario
@@ -53,14 +52,10 @@ KEY_SIZE = 16                  # bytes per key
 HOT_FRACTION = 0.2             # 20 % of keys
 HOT_SHARE = 0.8                # receive 80 % of reads
 
-# AWS standard S3 pricing (us-east-1, 2025)
+# AWS standard S3 pricing (ap-south-1, 2026)
 S3_PUT_COST_PER_1K = 0.005    # $ per 1,000 PUT/COPY/POST requests
 S3_GET_COST_PER_1K = 0.0004   # $ per 1,000 GET requests
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _rand_str(n: int) -> str:
     return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
@@ -68,17 +63,6 @@ def _rand_str(n: int) -> str:
 
 def _make_kv(n: int) -> dict[str, str]:
     return {_rand_str(KEY_SIZE): _rand_str(VALUE_SIZE) for _ in range(n)}
-
-
-def _setup_aws_env():
-    for k, v in {
-        "AWS_ACCESS_KEY_ID": "testing",
-        "AWS_SECRET_ACCESS_KEY": "testing",
-        "AWS_SECURITY_TOKEN": "testing",
-        "AWS_SESSION_TOKEN": "testing",
-        "AWS_DEFAULT_REGION": REGION,
-    }.items():
-        os.environ[k] = v
 
 
 def _fmt(label: str, value: float, unit: str, width: int = 38) -> str:
@@ -154,6 +138,15 @@ def _inject_counter(db: S4DB) -> _CountingProxy:
     proxy = _CountingProxy(db.storage._client)
     db.storage._client = proxy
     return proxy
+
+
+def _s3_delete_prefix(client, bucket: str, prefix: str) -> None:
+    """Delete all objects under the given prefix (handles pagination)."""
+    paginator = client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+        if objects:
+            client.delete_objects(Bucket=bucket, Delete={"Objects": objects})
 
 
 # ---------------------------------------------------------------------------
@@ -253,34 +246,28 @@ def bench_write_throughput():
     keys_list = list(data_all.keys())
 
     # --- batched ---
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            batches = [
-                {k: data_all[k] for k in keys_list[i: i + BATCH_SIZE]}
-                for i in range(0, WRITE_TOTAL_KEYS, BATCH_SIZE)
-            ]
-            t0 = time.perf_counter()
-            for batch in batches:
-                db.put(batch)
-            db.upload()
-            batched_elapsed = time.perf_counter() - t0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        batches = [
+            {k: data_all[k] for k in keys_list[i: i + BATCH_SIZE]}
+            for i in range(0, WRITE_TOTAL_KEYS, BATCH_SIZE)
+        ]
+        t0 = time.perf_counter()
+        for batch in batches:
+            db.put(batch)
+        db.upload()
+        batched_elapsed = time.perf_counter() - t0
 
     batched_tput = WRITE_TOTAL_KEYS / batched_elapsed
 
     # --- unbatched ---
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            t0 = time.perf_counter()
-            for k in keys_list:
-                db.put({k: data_all[k]})
-            db.upload()
-            unbatched_elapsed = time.perf_counter() - t0
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        t0 = time.perf_counter()
+        for k in keys_list:
+            db.put({k: data_all[k]})
+        db.upload()
+        unbatched_elapsed = time.perf_counter() - t0
 
     unbatched_tput = WRITE_TOTAL_KEYS / unbatched_elapsed
     speedup = unbatched_elapsed / batched_elapsed
@@ -324,32 +311,26 @@ def bench_read_latency():
     disk_latencies: list[float] = []
 
     # --- S3 range requests ---
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            db_write.put(data)
-            db_write.upload()
-            db_s3 = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
-            for key in trial_keys:
-                t0 = time.perf_counter()
-                db_s3.get(key)
-                s3_latencies.append((time.perf_counter() - t0) * 1000)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        db_write.put(data)
+        db_write.upload()
+        db_s3 = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
+        for key in trial_keys:
+            t0 = time.perf_counter()
+            db_s3.get(key)
+            s3_latencies.append((time.perf_counter() - t0) * 1000)
 
     # --- local disk reads ---
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            db_write.put(data)
-            db_write.upload()
-            db_disk = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            for key in trial_keys:
-                t0 = time.perf_counter()
-                db_disk.get(key)
-                disk_latencies.append((time.perf_counter() - t0) * 1000)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        db_write.put(data)
+        db_write.upload()
+        db_disk = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        for key in trial_keys:
+            t0 = time.perf_counter()
+            db_disk.get(key)
+            disk_latencies.append((time.perf_counter() - t0) * 1000)
 
     s3_stats   = _stats(s3_latencies)
     disk_stats = _stats(disk_latencies)
@@ -403,77 +384,67 @@ def bench_vs_naive():
     trial_keys = [read_keys[i] for i in _zipf_indices(READ_SETUP_KEYS, READ_TRIALS)]
 
     # ---- Naive S3 write ----
-    with mock_aws():
-        _setup_aws_env()
-        client = boto3.client("s3", region_name=REGION)
-        client.create_bucket(Bucket=BUCKET)
-        proxy = _CountingProxy(client)
-        naive = NaiveS3(proxy, BUCKET, PREFIX + "naive/")
+    client = boto3.client("s3", region_name=REGION)
+    proxy = _CountingProxy(client)
+    naive = NaiveS3(proxy, BUCKET, PREFIX + "naive/")
 
-        t0 = time.perf_counter()
-        naive.put(write_data)
-        naive_write_elapsed = time.perf_counter() - t0
-        naive_write_calls = dict(proxy.calls)
-        naive_write_puts = proxy.total_puts
+    t0 = time.perf_counter()
+    naive.put(write_data)
+    naive_write_elapsed = time.perf_counter() - t0
+    naive_write_calls = dict(proxy.calls)
+    naive_write_puts = proxy.total_puts
 
     naive_write_tput = WRITE_TOTAL_KEYS / naive_write_elapsed
+    _s3_delete_prefix(client, BUCKET, PREFIX + "naive/")
 
     # ---- s4db write (batched) ----
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            proxy = _inject_counter(db)
-            batches = [
-                {k: write_data[k] for k in write_keys[i: i + BATCH_SIZE]}
-                for i in range(0, WRITE_TOTAL_KEYS, BATCH_SIZE)
-            ]
-            t0 = time.perf_counter()
-            for batch in batches:
-                db.put(batch)
-            db.upload()
-            s4db_write_elapsed = time.perf_counter() - t0
-            s4db_write_calls = dict(proxy.calls)
-            s4db_write_puts = proxy.total_puts
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        proxy = _inject_counter(db)
+        batches = [
+            {k: write_data[k] for k in write_keys[i: i + BATCH_SIZE]}
+            for i in range(0, WRITE_TOTAL_KEYS, BATCH_SIZE)
+        ]
+        t0 = time.perf_counter()
+        for batch in batches:
+            db.put(batch)
+        db.upload()
+        s4db_write_elapsed = time.perf_counter() - t0
+        s4db_write_calls = dict(proxy.calls)
+        s4db_write_puts = proxy.total_puts
 
     s4db_write_tput = WRITE_TOTAL_KEYS / s4db_write_elapsed
 
     # ---- Naive S3 read ----
-    with mock_aws():
-        _setup_aws_env()
-        client = boto3.client("s3", region_name=REGION)
-        client.create_bucket(Bucket=BUCKET)
-        setup_proxy = _CountingProxy(client)
-        naive_setup = NaiveS3(setup_proxy, BUCKET, PREFIX + "naive/")
-        naive_setup.put(read_data)
+    client = boto3.client("s3", region_name=REGION)
+    setup_proxy = _CountingProxy(client)
+    naive_setup = NaiveS3(setup_proxy, BUCKET, PREFIX + "naive/")
+    naive_setup.put(read_data)
 
-        read_proxy = _CountingProxy(client)
-        naive_read = NaiveS3(read_proxy, BUCKET, PREFIX + "naive/")
-        naive_read_lats: list[float] = []
-        for key in trial_keys:
-            t0 = time.perf_counter()
-            naive_read.get(key)
-            naive_read_lats.append((time.perf_counter() - t0) * 1000)
-        naive_read_gets = read_proxy.total_gets
+    read_proxy = _CountingProxy(client)
+    naive_read = NaiveS3(read_proxy, BUCKET, PREFIX + "naive/")
+    naive_read_lats: list[float] = []
+    for key in trial_keys:
+        t0 = time.perf_counter()
+        naive_read.get(key)
+        naive_read_lats.append((time.perf_counter() - t0) * 1000)
+    naive_read_gets = read_proxy.total_gets
+    _s3_delete_prefix(client, BUCKET, PREFIX + "naive/")
 
     # ---- s4db read (S3 range) ----
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            db_write.put(read_data)
-            db_write.upload()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        db_write.put(read_data)
+        db_write.upload()
 
-            db_s3 = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
-            proxy = _inject_counter(db_s3)
-            s4db_read_lats: list[float] = []
-            for key in trial_keys:
-                t0 = time.perf_counter()
-                db_s3.get(key)
-                s4db_read_lats.append((time.perf_counter() - t0) * 1000)
-            s4db_read_gets = proxy.total_gets
+        db_s3 = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
+        proxy = _inject_counter(db_s3)
+        s4db_read_lats: list[float] = []
+        for key in trial_keys:
+            t0 = time.perf_counter()
+            db_s3.get(key)
+            s4db_read_lats.append((time.perf_counter() - t0) * 1000)
+        s4db_read_gets = proxy.total_gets
 
     # ---- Cost estimates ----
     def _cost(puts: int, gets: int) -> float:
@@ -570,32 +541,26 @@ def bench_s3_tax():
         bc.close()
 
     # ---- s4db – S3 range requests ----
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            db_write.put(data)
-            db_write.upload()
-            db_s3 = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
-            for key in trial_keys:
-                t0 = time.perf_counter()
-                db_s3.get(key)
-                s4db_s3_lats.append((time.perf_counter() - t0) * 1000)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        db_write.put(data)
+        db_write.upload()
+        db_s3 = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
+        for key in trial_keys:
+            t0 = time.perf_counter()
+            db_s3.get(key)
+            s4db_s3_lats.append((time.perf_counter() - t0) * 1000)
 
     # ---- s4db – local disk (files already present) ----
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            db_write.put(data)
-            db_write.upload()
-            db_disk = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            for key in trial_keys:
-                t0 = time.perf_counter()
-                db_disk.get(key)
-                s4db_disk_lats.append((time.perf_counter() - t0) * 1000)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_write = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        db_write.put(data)
+        db_write.upload()
+        db_disk = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        for key in trial_keys:
+            t0 = time.perf_counter()
+            db_disk.get(key)
+            s4db_disk_lats.append((time.perf_counter() - t0) * 1000)
 
     bc_stats   = _stats(bitcask_lats)
     s3_stats   = _stats(s4db_s3_lats)
@@ -661,22 +626,19 @@ def bench_workload_a():
 
     results = {}
     for batch_size in WA_BATCH_SIZES:
-        with mock_aws():
-            _setup_aws_env()
-            boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-            with tempfile.TemporaryDirectory() as tmpdir:
-                db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-                proxy = _inject_counter(db)
-                batches = [
-                    {k: data_all[k] for k in keys_list[i: i + batch_size]}
-                    for i in range(0, WA_TOTAL_KEYS, batch_size)
-                ]
-                t0 = time.perf_counter()
-                for batch in batches:
-                    db.put(batch)
-                db.upload()
-                elapsed = time.perf_counter() - t0
-                s3_puts = proxy.total_puts
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+            proxy = _inject_counter(db)
+            batches = [
+                {k: data_all[k] for k in keys_list[i: i + batch_size]}
+                for i in range(0, WA_TOTAL_KEYS, batch_size)
+            ]
+            t0 = time.perf_counter()
+            for batch in batches:
+                db.put(batch)
+            db.upload()
+            elapsed = time.perf_counter() - t0
+            s3_puts = proxy.total_puts
 
         tput = WA_TOTAL_KEYS / elapsed
         results[batch_size] = {"elapsed_ms": elapsed * 1000, "keys_per_sec": tput, "s3_puts": s3_puts}
@@ -719,39 +681,33 @@ def bench_workload_b():
     warm_lats: list[float] = []
 
     # ---- Cold: S3 range requests (no local dir) ----
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            db_w = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            # Write in large batches to keep setup fast
-            for i in range(0, WB_SETUP_KEYS, 10_000):
-                db_w.put({k: data[k] for k in keys_list[i: i + 10_000]})
-            db_w.upload()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        db_w = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        # Write in large batches to keep setup fast
+        for i in range(0, WB_SETUP_KEYS, 10_000):
+            db_w.put({k: data[k] for k in keys_list[i: i + 10_000]})
+        db_w.upload()
 
-            db_cold = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
-            for key in trial_keys:
-                t0 = time.perf_counter()
-                db_cold.get(key)
-                cold_lats.append((time.perf_counter() - t0) * 1_000)
+        db_cold = S4DB(bucket=BUCKET, prefix=PREFIX, region_name=REGION)
+        for key in trial_keys:
+            t0 = time.perf_counter()
+            db_cold.get(key)
+            cold_lats.append((time.perf_counter() - t0) * 1_000)
 
     # ---- Warm: download() then local disk reads ----
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as write_dir:
-            db_w = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=write_dir, region_name=REGION)
-            for i in range(0, WB_SETUP_KEYS, 10_000):
-                db_w.put({k: data[k] for k in keys_list[i: i + 10_000]})
-            db_w.upload()
+    with tempfile.TemporaryDirectory() as write_dir:
+        db_w = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=write_dir, region_name=REGION)
+        for i in range(0, WB_SETUP_KEYS, 10_000):
+            db_w.put({k: data[k] for k in keys_list[i: i + 10_000]})
+        db_w.upload()
 
-            with tempfile.TemporaryDirectory() as read_dir:
-                db_warm = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=read_dir, region_name=REGION)
-                db_warm.download()   # pull all data files locally
-                for key in trial_keys:
-                    t0 = time.perf_counter()
-                    db_warm.get(key)
-                    warm_lats.append((time.perf_counter() - t0) * 1_000)
+        with tempfile.TemporaryDirectory() as read_dir:
+            db_warm = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=read_dir, region_name=REGION)
+            db_warm.download()   # pull all data files locally
+            for key in trial_keys:
+                t0 = time.perf_counter()
+                db_warm.get(key)
+                warm_lats.append((time.perf_counter() - t0) * 1_000)
 
     cold_stats = _stats(cold_lats)
     warm_stats = _stats(warm_lats)
@@ -803,32 +759,29 @@ def bench_workload_c():
     total_start = 0.0
     total_end   = 0.0
 
-    with mock_aws():
-        _setup_aws_env()
-        boto3.client("s3", region_name=REGION).create_bucket(Bucket=BUCKET)
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Seed the database
-            db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            for i in range(0, WC_KEY_SPACE, 10_000):
-                db.put({k: initial_data[k] for k in all_keys[i: i + 10_000]})
-            db.upload()
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Seed the database
+        db = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        for i in range(0, WC_KEY_SPACE, 10_000):
+            db.put({k: initial_data[k] for k in all_keys[i: i + 10_000]})
+        db.upload()
 
-            # Re-open (simulates a fresh Lambda invocation loading from S3)
-            db2 = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
-            proxy = _inject_counter(db2)
+        # Re-open (simulates a fresh Lambda invocation loading from S3)
+        db2 = S4DB(bucket=BUCKET, prefix=PREFIX, local_dir=tmpdir, region_name=REGION)
+        proxy = _inject_counter(db2)
 
-            total_start = time.perf_counter()
-            for op, key in ops:
-                t0 = time.perf_counter()
-                if op == "get":
-                    db2.get(key)
-                    read_lats.append((time.perf_counter() - t0) * 1_000)
-                else:
-                    db2.put({key: _rand_str(WC_VALUE_SIZE)})
-                    write_lats.append((time.perf_counter() - t0) * 1_000)
-            db2.upload()
-            total_end = time.perf_counter()
-            s3_calls = dict(proxy.calls)
+        total_start = time.perf_counter()
+        for op, key in ops:
+            t0 = time.perf_counter()
+            if op == "get":
+                db2.get(key)
+                read_lats.append((time.perf_counter() - t0) * 1_000)
+            else:
+                db2.put({key: _rand_str(WC_VALUE_SIZE)})
+                write_lats.append((time.perf_counter() - t0) * 1_000)
+        db2.upload()
+        total_end = time.perf_counter()
+        s3_calls = dict(proxy.calls)
 
     total_elapsed = total_end - total_start
     total_ops     = len(ops)
