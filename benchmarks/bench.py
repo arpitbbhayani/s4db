@@ -34,9 +34,9 @@ from s4db import S4DB
 # Config
 # ---------------------------------------------------------------------------
 
-BUCKET = "bench-bucket"
+BUCKET = "s4db-bench"
 PREFIX = "bench/"
-REGION = "ap-east-1"
+REGION = "ap-south-1"
 
 # Write benchmark
 WRITE_TOTAL_KEYS = 2_000       # total key/value pairs written per scenario
@@ -837,5 +837,11 @@ if __name__ == "__main__":
     bench_workload_c()
 
     print(_separator("="))
+
+    print("Cleaning up S3 ...")
+    client = boto3.client("s3", region_name=REGION)
+    _s3_delete_prefix(client, BUCKET, PREFIX)
+    print(f"  Deleted all objects under s3://{BUCKET}/{PREFIX}")
+
     print("Done.")
     print()

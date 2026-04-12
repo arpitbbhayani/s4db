@@ -304,15 +304,15 @@ db.upload()         # push repaired index to S3
 
 ## Benchmarks
 
-Run the suite yourself (no AWS credentials required — uses moto):
+Run the suite yourself (requires real AWS credentials and an S3 bucket):
 
 ```bash
 python benchmarks/bench.py
 ```
 
-All numbers below are from moto (in-process S3 mock). Real S3 adds 5–50 ms of
-network RTT on top of the mocked figures; the relative rankings and request-count
-comparisons are unaffected.
+All numbers below are from real S3 (ap-east-1). Results will vary with region
+and network conditions, but the relative rankings and request-count comparisons
+hold across environments.
 
 ### 1. Write throughput — batched vs unbatched
 
@@ -320,13 +320,14 @@ comparisons are unaffected.
 
 | Scenario                               | Throughput        | Elapsed    |
 | -------------------------------------- | ----------------- | ---------- |
-| `put(100 keys)` × 20 + `upload()`     | ~38 000 keys/sec  | ~52 ms     |
-| `put(1 key)` × 2 000 + `upload()`     | ~935 keys/sec     | ~2 139 ms  |
-| Batched speedup                        | ~41×              |            |
+| `put(100 keys)` × 20 + `upload()`     | ~6 134 keys/sec   | ~326 ms    |
+| `put(1 key)` × 2 000 + `upload()`     | ~749 keys/sec     | ~2 669 ms  |
+| Batched speedup                        | ~8×               |            |
 
-Each unbatched `put()` appends to the data file and rewrites the index file to
-disk. That per-call overhead dominates. A single `put()` with all keys amortizes
-both costs to near zero per key.
+Every `put()` call ends by rewriting the entire in-memory index to disk
+(`_write_entries` → `flush()` → `_save_index()`). Unbatched writes trigger this
+full index serialization on every single call — 2 000 times vs 20 times for
+batched — and that repeated disk I/O dominates elapsed time.
 
 ### 2. Read latency — S3 range request vs local disk
 
