@@ -429,25 +429,35 @@ equal, so the entire cost gap comes from write-side request reduction.
 
 To quantify what S3 costs in latency terms, s4db's two read paths are compared
 against a minimal local Bitcask (same append-only-log + in-memory-index design,
-pure disk, no S3). 1000 keys pre-loaded, 500 `get()` trials.
+pure disk, no S3). 1000 keys pre-loaded, 500 `get()` trials. All numbers are
+from real S3 (ap-south-1).
 
 | Metric | Local Bitcask | s4db local disk | s4db S3 range |
 | ------ | ------------- | --------------- | ------------- |
-| mean   | 0.002 ms      | 0.011 ms        | 1.281 ms      |
-| median | 0.002 ms      | 0.010 ms        | 1.188 ms      |
-| p95    | 0.002 ms      | 0.014 ms        | 1.656 ms      |
-| p99    | 0.004 ms      | 0.041 ms        | 2.987 ms      |
+| mean   | 0.001 ms      | 0.008 ms        | 50.235 ms     |
+| median | 0.001 ms      | 0.008 ms        | 49.332 ms     |
+| p95    | 0.002 ms      | 0.009 ms        | 57.650 ms     |
+| p99    | 0.003 ms      | 0.016 ms        | 111.778 ms    |
+| min    | 0.000 ms      | 0.008 ms        | 37.437 ms     |
+| max    | 0.007 ms      | 0.084 ms        | 130.381 ms    |
 
-s4db's local disk path is ~7× slower than a bare Bitcask. The gap comes from
-Snappy decompression and the s4db entry-format parse on top of an otherwise
-identical seek. No S3 is involved.
+**Local Bitcask (~0.001 ms):** The fastest possible baseline - a raw binary file
+with a 6-byte header per entry, a single `pread()` to the exact offset, and no
+decompression. The entire read is one syscall after a memory lookup.
 
-S3 range requests (mocked) add another ~117× on top of local disk reads.
-On real S3 that gap will be larger - a typical range-request RTT is 5–50 ms,
-versus ~0.01 ms for a local seek. The trade-off is explicit and intentional: s4db
-is designed for durable, serverless workloads where there is no local disk. When
-a local directory is available, `download()` + local reads bring latency back
-to the local-disk column.
+**s4db local disk (~0.008 ms, ~8x vs Bitcask):** Same append-only-log + in-memory-index
+design, but `get()` also decompresses the value with Snappy and parses the s4db
+entry format on top of the identical seek. No S3 is involved. That extra work
+accounts for the ~8x gap over the bare Bitcask.
+
+**s4db S3 range (~50 ms, ~6000x vs local disk):** Every `get()` issues an HTTP
+range request to S3 in ap-south-1, paying a full network round-trip before a
+single byte is returned. The ~50 ms mean is the baseline RTT to S3 from the test
+host; the p99 spike to ~112 ms reflects occasional S3 tail latency when a GET
+hits a cold shard or internal housekeeping. This is the explicit cost of
+serverless durability - no local disk is required at all. When a local directory
+is available, `download()` + local reads bring latency back to the local-disk
+column.
 
 ### Workload A - bulk write throughput at scale (100 000 keys, 256 B values)
 

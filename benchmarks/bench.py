@@ -586,12 +586,6 @@ def bench_s3_tax():
     print(f"    s4db local disk: {disk_tax_mean:.1f}x slower  "
           f"(+{disk_stats['mean'] - bc_stats['mean']:.3f} ms per read)")
     print()
-    print("  Interpretation:")
-    print(f"    The local disk path of s4db adds ~{disk_tax_mean:.1f}x overhead vs a pure-local")
-    print(f"    Bitcask (Snappy decompression + index lookup on top of a raw seek).")
-    print(f"    S3 range requests add a further ~{s3_tax_mean / disk_tax_mean:.1f}x on top of that -")
-    print(f"    that is the S3 network/protocol tax for serverless durability.")
-    print()
 
     return {
         "bitcask":    bc_stats,
@@ -828,10 +822,6 @@ if __name__ == "__main__":
     bench_vs_naive()
     bench_s3_tax()
 
-    print()
-    print("=" * 60)
-    print("EXTENDED WORKLOADS  (100k key space)")
-    print("=" * 60)
     bench_workload_a()
     bench_workload_b()
     bench_workload_c()
