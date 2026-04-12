@@ -49,7 +49,7 @@ Local disk - hot vs cold key breakdown:
 The ~50 ms S3 mean is pure network round-trip time from ap-south-1. A range
 request must cross the public internet to S3, wait for the object store to
 seek to the byte offset, and stream the response back - all before the caller
-gets a value. Even a fast region adds 35–60 ms of baseline RTT.
+gets a value. Even a fast region adds 35-60 ms of baseline RTT.
 
 The p99 spike to ~294 ms is S3 tail latency: occasional GETs are queued
 behind internal S3 housekeeping or hit a cold shard. This is a well-known
@@ -84,7 +84,7 @@ S3 API call breakdown (writes):
 | Naive S3 | `put_object` × 2000                         |
 | s4db     | `upload_file` × 1 (data file) + `put_object` × 1 (index) |
 
-**Why write throughput is 181× faster?**
+#### Why write throughput is 181× faster?
 
 Naive S3 makes 2000 sequential `put_object` calls - one per key.
 Each call incurs a full S3 round-trip (~50 ms),
@@ -94,24 +94,24 @@ time. s4db appends all 2000 keys to a single local data file and calls
 file and one `put_object` for the serialized index. The network round-trip cost
 is therefore amortized across all 2000 keys instead of paid per key.
 
-**Why S3 PUT count is 1000× lower?**
+#### Why S3 PUT count is 1000× lower?
 
 s4db's write path is append-local,
 upload-once: `put()` writes to a local file, and `upload()` pushes the file to
 S3 as a single object. No matter how many keys are in that batch, one data file
 → one S3 PUT. Naive S3 has no such batching; every key is its own object.
 
-**Why read latency is similar (and s4db is slightly faster)?**
+#### Why read latency is similar (and s4db is slightly faster)?
 
 Both approaches issue one S3 GET per `get()` call, so both pay the
-same ~50–60 ms network RTT. s4db uses a range request to fetch only
+same ~50-60 ms network RTT. s4db uses a range request to fetch only
 the exact bytes for that entry; Naive S3 fetches the full object.
 For the 256 B values in this benchmark the objects
 are tiny, so the object-size advantage is small - but the range request still
 avoids transferring any surrounding data, giving s4db a modest edge at both
 mean and p99.
 
-**Why cost is 49× lower?**
+#### Why cost is 49× lower?
 
 S3 API pricing is per-request. At $0.005/1000 PUTs,
 2000 PUTs cost $0.010. s4db's 2 PUTs cost effectively nothing in PUT fees;
@@ -172,7 +172,7 @@ because `upload()` is called once at the end.
 
 Two effects determine the shape of these numbers:
 
-**Flush cost (drives the speedup).**
+#### Flush cost (drives the speedup)
 
 Every `put()` serializes the full in-memory
 index to disk before returning. With batch size 100, that flush runs 1 000 times
@@ -180,7 +180,7 @@ index to disk before returning. With batch size 100, that flush runs 1 000 times
 amortize this O(index-size) serialization across more keys, which is why throughput
 rises with batch size.
 
-**Real S3 upload cost (caps the speedup at ~3.8×).**
+#### Real S3 upload cost (caps the speedup at ~3.8×)
 
 After all the `put()` calls
 finish, a single `upload()` pushes the data file and index to S3 over the network.
@@ -207,7 +207,7 @@ All numbers are from real S3 (ap-east-1).
 | min    | 37.858 ms       | 0.008 ms          | ~4825×   |
 | max    | 136.738 ms      | 0.121 ms          | ~1132×   |
 
-**Why cold reads are ~50 ms regardless of dataset size.**
+#### Why cold reads are ~50 ms regardless of dataset size
 
 Each cold `get()` issues an HTTP range request to S3, specifying the exact byte
 range for that entry. S3 seeks to that offset server-side and streams back only
@@ -217,7 +217,7 @@ file. The 100 000-key cold numbers are nearly identical to the 1 000-key cold
 numbers in benchmark 2: scaling the dataset by 100× has no effect on read
 latency because the range request size does not change.
 
-**Why warm reads are ~0.009 ms regardless of dataset size.**
+#### Why warm reads are ~0.009 ms regardless of dataset size
 
 After `download()`, all data files are present locally. `get()` looks up the
 exact file number and byte offset in the in-memory index and issues a single
@@ -226,7 +226,7 @@ how many keys are in the database. The ~0.009 ms warm latency is
 indistinguishable from the 1 000-key case in benchmark 2 for the same reason:
 the seek is to a known offset, so dataset size does not matter.
 
-**Why the p99 spike reaches ~113 ms.**
+#### Why the p99 spike reaches ~113 ms
 
 The cold p99 reflects S3 tail latency - occasional GETs that hit a cold shard
 or internal housekeeping on the S3 side. This is consistent with the p99 spikes
@@ -234,7 +234,7 @@ observed in benchmarks 2 and 4 and is a known property of cloud object stores.
 The warm p99 stays at 0.018 ms because disk seeks are deterministic and
 unaffected by S3 internals.
 
-**The practical takeaway.**
+#### The practical takeaway
 
 Calling `download()` once at startup amortizes the full S3 transfer cost across
 all subsequent reads. After that, every `get()` runs at local-disk speed - a
@@ -263,7 +263,7 @@ Per-operation latency breakdown:
 | p95    | 0.080 ms     | 225.625 ms    |
 | p99    | 0.096 ms     | 239.459 ms    |
 
-**Why throughput is only ~98 ops/sec despite 80% fast reads.**
+#### Why throughput is only ~98 ops/sec despite 80% fast reads
 
 The total elapsed time is dominated almost entirely by write latency. With 2,000
 writes at a mean of ~48.6 ms each, the write path alone accounts for roughly
@@ -271,7 +271,7 @@ writes at a mean of ~48.6 ms each, the write path alone accounts for roughly
 (8,000 × 0.025 ms). In a mixed workload the slow operation sets the pace:
 10,000 ops / 102 s = ~98 ops/sec, almost exactly what the write cost predicts.
 
-**Why each write costs ~27-48 ms when no S3 call is made.**
+#### Why each write costs ~27-48 ms when no S3 call is made
 
 Every `put()` serializes the entire in-memory index to disk before returning
 (`_write_entries` → `flush()` → `_save_index()`). At 100,000 entries the index
@@ -280,7 +280,7 @@ file is large, and that full serialization runs on every single `put()` call -
 calls happen only at the final `upload()`), so the cost is pure local disk I/O
 repeated 2,000 times.
 
-**Why write latency is skewed: median 27 ms but mean 48 ms and p99 239 ms.**
+#### Why write latency is skewed: median 27 ms but mean 48 ms and p99 239 ms
 
 The distribution has a long right tail. Most index flushes complete in ~27 ms,
 but roughly 1 in 20 spikes to 225+ ms. The spikes occur when the OS decides to
@@ -289,7 +289,7 @@ enough that the kernel's write-back buffers fill up and a synchronous flush is
 forced, stalling the `put()` call until the underlying storage catches up. The
 mean is dragged above the median by these infrequent but expensive stalls.
 
-**The practical Lambda takeaway.**
+#### The practical Lambda takeaway
 
 In a Lambda invocation pattern, the correct approach is to batch all writes into
 a single `put(batch)` + `upload()` at the end rather than calling `put()` once
