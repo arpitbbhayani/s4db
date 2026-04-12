@@ -331,19 +331,40 @@ batched — and that repeated disk I/O dominates elapsed time.
 
 ### 2. Read latency — S3 range request vs local disk
 
-1 000 keys pre-loaded, 500 `get()` trials, Zipf-like hot/cold distribution
+1,000 keys pre-loaded, 500 `get()` trials, Zipf-like hot/cold distribution
 (top 20% of keys receive 80% of reads).
 
-| Metric | S3 range request | Local disk | Speedup |
-| ------ | ---------------- | ---------- | ------- |
-| mean   | 1.495 ms         | 0.026 ms   | ~57×    |
-| median | 1.431 ms         | 0.022 ms   | ~65×    |
-| p95    | 2.301 ms         | 0.042 ms   | ~55×    |
-| p99    | 2.709 ms         | 0.106 ms   | ~26×    |
+| Metric | S3 range request | Local disk | Speedup   |
+| ------ | ---------------- | ---------- | --------- |
+| mean   | 55.964 ms        | 0.008 ms   | ~6871×   |
+| median | 49.411 ms        | 0.008 ms   | ~6350×   |
+| p95    | 59.577 ms        | 0.009 ms   | ~6949×   |
+| p99    | 293.937 ms       | 0.011 ms   | ~26044×  |
+| min    | 38.538 ms        | 0.008 ms   | ~5120×   |
+| max    | 345.966 ms       | 0.099 ms   | ~3511×   |
 
-Hot and cold keys show near-identical local-disk latency (~0.02 ms) — the in-memory
-index stores the exact file number and byte offset, so every read is a direct seek
-with no scanning.
+Local disk — hot vs cold key breakdown:
+
+| Key set              | mean     | p95      | n    |
+| -------------------- | -------- | -------- | ---- |
+| Hot  (top 20%)       | 0.008 ms | 0.008 ms | 400  |
+| Cold (bottom 80%)    | 0.008 ms | 0.010 ms | 100  |
+
+The ~50 ms S3 mean is pure network round-trip time from ap-south-1. A range
+request must cross the public internet to S3, wait for the object store to
+seek to the byte offset, and stream the response back — all before the caller
+gets a value. Even a fast region adds 35–60 ms of baseline RTT.
+
+The p99 spike to ~294 ms is S3 tail latency: occasional GETs are queued
+behind internal S3 housekeeping or hit a cold shard. This is a well-known
+property of cloud object stores and does not reflect anything wrong with
+the client.
+
+Local disk reads land at ~0.008 ms regardless of whether the key is hot or
+cold. The in-memory index stores the exact file number and byte offset for
+every key, so every `get()` is a single `pread()` call to the right position
+in the data file — no scanning, no cache warming needed. Hot and cold keys
+are therefore indistinguishable at the disk layer.
 
 ### 3. s4db vs Naive S3 (one object per key)
 
