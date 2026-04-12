@@ -1,15 +1,15 @@
 """
 Benchmarks for s4db.
 
-Measures four things:
-  1. Write throughput  -- s4db batched put() + upload() vs s4db unbatched
-  2. Read latency      -- S3 range request vs local disk, with a hot/cold key
-                         distribution (Zipf-like: ~20% of keys receive ~80% of reads)
-  3. s4db vs Naive S3  -- head-to-head: throughput, S3 API request count, and
-                         estimated cost against the straw-man of one
-                         put_object / get_object per key
-  4. S3 tax            -- local Bitcask vs s4db (S3 range) vs s4db (local disk),
-                         to quantify the latency overhead introduced by S3
+  1. Write Throughput       -- s4db batched put() + upload() vs unbatched
+  2. Read Latency           -- S3 range request vs local disk, hot/cold distribution
+                               (Zipf-like: ~20% of keys receive ~80% of reads)
+  3. s4db vs Naive S3       -- throughput, S3 API request count, and estimated cost
+                               vs the straw-man of one put_object / get_object per key
+  4. S3 Tax                 -- local Bitcask vs s4db (S3 range) vs s4db (local disk)
+  5. Bulk Write Scaling     -- write throughput as a function of batch size
+  6. Cold vs Warm Read      -- S3 range request latency vs local disk after download()
+  7. Mixed Read/Write       -- 80/20 read/write mix, end-of-invocation flush pattern
 
 Requires real AWS credentials and an S3 bucket (set BUCKET / PREFIX / REGION below).
 Run with:
@@ -67,10 +67,6 @@ def _make_kv(n: int) -> dict[str, str]:
 
 def _fmt(label: str, value: float, unit: str, width: int = 38) -> str:
     return f"  {label:<{width}} {value:>10.2f}  {unit}"
-
-
-def _separator(char: str = "-", width: int = 60) -> str:
-    return char * width
 
 
 def _zipf_indices(total_keys: int, n_trials: int) -> list[int]:
@@ -235,12 +231,11 @@ class LocalBitcask:
 # ---------------------------------------------------------------------------
 
 def bench_write_throughput():
-    print(_separator("="))
+    print("=" * 60)
     print("BENCHMARK 1 - Write Throughput  (s4db batched vs unbatched)")
     print(f"  {WRITE_TOTAL_KEYS} key/value pairs, value size ~{VALUE_SIZE} B")
     print(f"  batched: {WRITE_TOTAL_KEYS // BATCH_SIZE} calls of put({BATCH_SIZE} keys)  |  "
           f"unbatched: {WRITE_TOTAL_KEYS} calls of put(1 key)")
-    print(_separator())
 
     data_all = _make_kv(WRITE_TOTAL_KEYS)
     keys_list = list(data_all.keys())
@@ -293,12 +288,11 @@ def bench_write_throughput():
 # ---------------------------------------------------------------------------
 
 def bench_read_latency():
-    print(_separator("="))
+    print("=" * 60)
     print("BENCHMARK 2 - Read Latency  (hot/cold distribution)")
     print(f"  {READ_SETUP_KEYS} keys pre-loaded, {READ_TRIALS} get() trials")
     print(f"  hot set: top {int(HOT_FRACTION*100)}% of keys → "
           f"{int(HOT_SHARE*100)}% of reads  (Zipf-like)")
-    print(_separator())
 
     data = _make_kv(READ_SETUP_KEYS)
     keys_list = list(data.keys())
@@ -369,12 +363,11 @@ def bench_read_latency():
 # ---------------------------------------------------------------------------
 
 def bench_vs_naive():
-    print(_separator("="))
+    print("=" * 60)
     print("BENCHMARK 3 - s4db vs Naive S3  (head-to-head)")
     print(f"  Naive S3: one put_object / get_object per key")
     print(f"  s4db:     batched put({BATCH_SIZE}) + upload()  /  range-request get()")
     print(f"  {WRITE_TOTAL_KEYS} writes, {READ_TRIALS} reads ({READ_SETUP_KEYS} key corpus)")
-    print(_separator())
 
     write_data = _make_kv(WRITE_TOTAL_KEYS)
     write_keys = list(write_data.keys())
@@ -512,14 +505,13 @@ def bench_vs_naive():
 # ---------------------------------------------------------------------------
 
 def bench_s3_tax():
-    print(_separator("="))
+    print("=" * 60)
     print("BENCHMARK 4 - S3 Tax  (local Bitcask vs s4db)")
     print("  Shows the latency overhead that S3 adds on top of the same")
     print("  append-only-log + in-memory-index design running purely on disk.")
     print(f"  {READ_SETUP_KEYS} keys pre-loaded, {READ_TRIALS} get() trials")
     print(f"  hot set: top {int(HOT_FRACTION*100)}% of keys → "
           f"{int(HOT_SHARE*100)}% of reads  (Zipf-like)")
-    print(_separator())
 
     data = _make_kv(READ_SETUP_KEYS)
     keys_list = list(data.keys())
@@ -597,7 +589,7 @@ def bench_s3_tax():
 
 
 # ---------------------------------------------------------------------------
-# Workload A – Bulk write throughput as a function of batch size
+# Benchmark 5 - Bulk Write Scaling (throughput as a function of batch size)
 # ---------------------------------------------------------------------------
 
 WA_TOTAL_KEYS  = 100_000
@@ -607,13 +599,12 @@ WA_VALUE_SIZE  = 256
 WA_BATCH_SIZES = [100, 1_000, 10_000]
 
 
-def bench_workload_a():
-    print(_separator("="))
-    print("WORKLOAD A - Bulk Write Throughput  (batch size sweep)")
+def bench_batch_write_scaling():
+    print("=" * 60)
+    print("BENCHMARK 5 - Bulk Write Throughput  (batch size sweep)")
     print(f"  {WA_TOTAL_KEYS:,} key/value pairs, value size {WA_VALUE_SIZE} B")
     print(f"  Batch sizes tested: {WA_BATCH_SIZES}")
-    print(f"  Pattern: put(batch) × (total/batch) then one upload()")
-    print(_separator())
+    print(f"  Pattern: put(batch) x (total/batch) then one upload()")
 
     data_all = {_rand_str(KEY_SIZE): _rand_str(WA_VALUE_SIZE) for _ in range(WA_TOTAL_KEYS)}
     keys_list = list(data_all.keys())
@@ -651,7 +642,7 @@ def bench_workload_a():
 
 
 # ---------------------------------------------------------------------------
-# Workload B – Point read latency: cold (S3 range) vs warm (local after download)
+# Benchmark 6 - Cold vs Warm Read Latency (S3 range vs local after download)
 # ---------------------------------------------------------------------------
 
 WB_SETUP_KEYS = 100_000
@@ -659,13 +650,12 @@ WB_VALUE_SIZE = 256
 WB_TRIALS     = 500
 
 
-def bench_workload_b():
-    print(_separator("="))
-    print("WORKLOAD B - Point Read Latency  (cold S3 range vs warm local disk)")
+def bench_cold_warm_read():
+    print("=" * 60)
+    print("BENCHMARK 6 - Cold vs Warm Read Latency")
     print(f"  {WB_SETUP_KEYS:,} keys pre-loaded, {WB_TRIALS} get() trials")
-    print(f"  Cold : no local files - each get() issues an S3 range request")
-    print(f"  Warm : download() called first - reads served from local disk")
-    print(_separator())
+    print(f"  Cold: no local files - each get() issues an S3 range request")
+    print(f"  Warm: download() called first - reads served from local disk")
 
     data = {_rand_str(KEY_SIZE): _rand_str(WB_VALUE_SIZE) for _ in range(WB_SETUP_KEYS)}
     keys_list = list(data.keys())
@@ -719,7 +709,7 @@ def bench_workload_b():
 
 
 # ---------------------------------------------------------------------------
-# Workload C – Mixed read/write (80/20 split, 100k key space)
+# Benchmark 7 - Mixed Read/Write (80/20 split, end-of-invocation flush)
 # ---------------------------------------------------------------------------
 
 WC_KEY_SPACE     = 100_000
@@ -728,13 +718,12 @@ WC_OPERATIONS    = 10_000
 WC_READ_FRACTION = 0.80
 
 
-def bench_workload_c():
-    print(_separator("="))
-    print("WORKLOAD C - Mixed Read/Write  (realistic Lambda invocation pattern)")
+def bench_mixed_rw():
+    print("=" * 60)
+    print("BENCHMARK 7 - Mixed Read/Write  (Lambda invocation pattern)")
     print(f"  {WC_KEY_SPACE:,} key space, {WC_OPERATIONS:,} operations")
     print(f"  Mix: {int(WC_READ_FRACTION*100)}% reads / {int((1-WC_READ_FRACTION)*100)}% writes")
-    print(f"  Upload() called once at the end (end-of-invocation flush pattern)")
-    print(_separator())
+    print(f"  upload() called once at end (end-of-invocation flush)")
 
     # Pre-populate the key space
     all_keys = [_rand_str(KEY_SIZE) for _ in range(WC_KEY_SPACE)]
@@ -806,15 +795,12 @@ def bench_workload_c():
 if __name__ == "__main__":
     random.seed(42)
     print()
-    print("s4db benchmark")
-    print(_separator("="))
-    print(f"  write total keys : {WRITE_TOTAL_KEYS}")
-    print(f"  batch size       : {BATCH_SIZE}")
-    print(f"  read setup keys  : {READ_SETUP_KEYS}")
-    print(f"  read trials      : {READ_TRIALS}")
+    print("s4db benchmark suite")
+    print(f"  bucket           : s3://{BUCKET}/{PREFIX}  ({REGION})")
+    print(f"  write keys       : {WRITE_TOTAL_KEYS:,}  (batch size {BATCH_SIZE})")
+    print(f"  read setup keys  : {READ_SETUP_KEYS:,}  ({READ_TRIALS} trials)")
     print(f"  value size       : {VALUE_SIZE} B")
-    print(f"  hot/cold split   : top {int(HOT_FRACTION*100)}% keys → "
-          f"{int(HOT_SHARE*100)}% reads")
+    print(f"  hot/cold split   : top {int(HOT_FRACTION*100)}% keys get {int(HOT_SHARE*100)}% of reads")
     print()
 
     bench_write_throughput()
@@ -822,11 +808,11 @@ if __name__ == "__main__":
     bench_vs_naive()
     bench_s3_tax()
 
-    bench_workload_a()
-    bench_workload_b()
-    bench_workload_c()
+    bench_batch_write_scaling()
+    bench_cold_warm_read()
+    bench_mixed_rw()
 
-    print(_separator("="))
+    print("=" * 60)
 
     print("Cleaning up S3 ...")
     client = boto3.client("s3", region_name=REGION)

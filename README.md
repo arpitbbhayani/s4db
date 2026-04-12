@@ -459,7 +459,7 @@ serverless durability - no local disk is required at all. When a local directory
 is available, `download()` + local reads bring latency back to the local-disk
 column.
 
-### Workload A - bulk write throughput at scale (100 000 keys, 256 B values)
+### 5. Bulk write throughput at scale (100000 keys, 256 B values)
 
 Pattern: `put(batch)` repeated until all keys are written, then one `upload()`.
 `batch_size=1` is omitted: each `put(1)` flushes the full index to disk, making it
@@ -467,14 +467,34 @@ O(n²) in index size at 100 k scale.
 
 | Batch size | keys/sec    | Elapsed     | S3 PUTs | Speedup vs batch 100 |
 | ---------: | ----------: | ----------: | ------: | -------------------: |
-| 100        | ~4 500      | ~22 282 ms  | 2       | 1×                   |
-| 1000      | ~41 600     | ~2 403 ms   | 2       | ~9×                  |
-| 10 000     | ~114 000    | ~876 ms     | 2       | ~25×                 |
+| 100        | ~4519       | ~22128 ms   | 2       | 1×                   |
+| 1000       | ~12769      | ~7832 ms    | 2       | ~2.8×                |
+| 10000      | ~17195      | ~5816 ms    | 2       | ~3.8×                |
 
 S3 PUT count is constant at 2 (one data file, one index) regardless of batch size,
-because `upload()` is called once at the end. The speedup is entirely from fewer
-`flush()` calls: `put()` serializes the full in-memory index to disk on every call,
-so larger batches amortize that cost across more keys.
+because `upload()` is called once at the end.
+
+Two effects determine the shape of these numbers:
+
+**Flush cost (drives the speedup).**
+
+Every `put()` serializes the full in-memory
+index to disk before returning. With batch size 100, that flush runs 1 000 times
+(100 000 / 100); with batch size 10 000 it runs only 10 times. Larger batches
+amortize this O(index-size) serialization across more keys, which is why throughput
+rises with batch size.
+
+**Real S3 upload cost (caps the speedup at ~3.8×).**
+
+After all the `put()` calls
+finish, a single `upload()` pushes the data file and index to S3 over the network.
+On real S3 that transfer takes several seconds regardless of batch size. At batch
+100, the 1 000 flushes dominate (~17 s of disk I/O) and the upload is a small
+fraction of the total. At batch 10 000, the 10 flushes complete in under a second,
+but the upload still costs the same several seconds - it becomes the bottleneck.
+The speedup ceiling is therefore set by the ratio of (flush work saved) to
+(fixed upload cost), which on real S3 is only ~3.8× rather than the ~25× seen
+with a mocked S3 where `upload()` is effectively free.
 
 ### Workload B - point read latency at scale (100 000 keys pre-loaded, 500 trials)
 
