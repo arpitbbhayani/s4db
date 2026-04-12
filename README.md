@@ -314,22 +314,22 @@ All numbers below are from real S3 (ap-east-1). Results will vary with region
 and network conditions, but the relative rankings and request-count comparisons
 hold across environments.
 
-### 1. Write throughput — batched vs unbatched
+### 1. Write throughput - batched vs unbatched
 
-2 000 key/value pairs, ~256 B values, one `upload()` at the end.
+2000 key/value pairs, ~256 B values, one `upload()` at the end.
 
 | Scenario                               | Throughput        | Elapsed    |
 | -------------------------------------- | ----------------- | ---------- |
 | `put(100 keys)` × 20 + `upload()`     | ~6 134 keys/sec   | ~326 ms    |
-| `put(1 key)` × 2 000 + `upload()`     | ~749 keys/sec     | ~2 669 ms  |
+| `put(1 key)` × 2000 + `upload()`     | ~749 keys/sec     | ~2 669 ms  |
 | Batched speedup                        | ~8×               |            |
 
 Every `put()` call ends by rewriting the entire in-memory index to disk
 (`_write_entries` → `flush()` → `_save_index()`). Unbatched writes trigger this
-full index serialization on every single call — 2 000 times vs 20 times for
-batched — and that repeated disk I/O dominates elapsed time.
+full index serialization on every single call - 2000 times vs 20 times for
+batched - and that repeated disk I/O dominates elapsed time.
 
-### 2. Read latency — S3 range request vs local disk
+### 2. Read latency - S3 range request vs local disk
 
 1,000 keys pre-loaded, 500 `get()` trials, Zipf-like hot/cold distribution
 (top 20% of keys receive 80% of reads).
@@ -343,7 +343,7 @@ batched — and that repeated disk I/O dominates elapsed time.
 | min    | 38.538 ms        | 0.008 ms   | ~5120×   |
 | max    | 345.966 ms       | 0.099 ms   | ~3511×   |
 
-Local disk — hot vs cold key breakdown:
+Local disk - hot vs cold key breakdown:
 
 | Key set              | mean     | p95      | n    |
 | -------------------- | -------- | -------- | ---- |
@@ -352,7 +352,7 @@ Local disk — hot vs cold key breakdown:
 
 The ~50 ms S3 mean is pure network round-trip time from ap-south-1. A range
 request must cross the public internet to S3, wait for the object store to
-seek to the byte offset, and stream the response back — all before the caller
+seek to the byte offset, and stream the response back - all before the caller
 gets a value. Even a fast region adds 35–60 ms of baseline RTT.
 
 The p99 spike to ~294 ms is S3 tail latency: occasional GETs are queued
@@ -363,44 +363,73 @@ the client.
 Local disk reads land at ~0.008 ms regardless of whether the key is hot or
 cold. The in-memory index stores the exact file number and byte offset for
 every key, so every `get()` is a single `pread()` call to the right position
-in the data file — no scanning, no cache warming needed. Hot and cold keys
+in the data file - no scanning, no cache warming needed. Hot and cold keys
 are therefore indistinguishable at the disk layer.
 
 ### 3. s4db vs Naive S3 (one object per key)
 
 The straw-man baseline: each key is a separate S3 object, written with
-`put_object` and read with `get_object`. 2 000 writes + 500 reads on a 1 000-key
-corpus.
+`put_object` and read with `get_object`. 2000 writes + 500 reads on a 1000-key
+corpus. All numbers are from real S3 (ap-south-1).
 
 | Metric               | Naive S3          | s4db (batched)    | s4db advantage    |
 | -------------------- | ----------------- | ----------------- | ----------------- |
-| Write throughput     | ~680 keys/sec     | ~52 750 keys/sec  | ~78× faster       |
-| S3 PUT requests      | 2 000             | 2                 | 1 000× fewer      |
+| Write throughput     | ~14 keys/sec      | ~2485 keys/sec    | ~181× faster      |
+| S3 PUT requests      | 2000              | 2                 | 1000× fewer       |
 | S3 GET requests      | 500               | 500               | equal             |
-| Read mean latency    | 1.341 ms          | 1.243 ms          | ~1.1× faster      |
-| Read p99 latency     | 2.122 ms          | 2.265 ms          | s4db is slower    |
+| Read mean latency    | 61.243 ms         | 52.796 ms         | ~1.2× faster      |
+| Read p99 latency     | 125.905 ms        | 115.535 ms        | ~1.1× faster      |
 | Estimated API cost   | $0.010200         | $0.000210         | ~49× cheaper      |
 
-Cost is dominated by the 2 000 PUT requests naive S3 issues ($0.005/1 000 PUTs).
-s4db collapses that to 2 S3 calls regardless of how many keys are written — one
-data-file upload and one index upload — so the per-key API cost is essentially
-zero at scale. Read-request counts are equal because both approaches make one S3
-GET per `get()` call; the difference is that s4db fetches only the exact bytes for
-that entry (range request) rather than the full object.
+S3 API call breakdown (writes):
 
-At mean, s4db reads are marginally faster. At p99, s4db is slightly slower:
-the range-request overhead adds tail latency that per-object fetches avoid when
-the objects are small (256 B). The S3 cost and write throughput advantages are
-unambiguous; read latency is a wash.
+| Approach | Calls                                       |
+| -------- | ------------------------------------------- |
+| Naive S3 | `put_object` × 2000                         |
+| s4db     | `upload_file` × 1 (data file) + `put_object` × 1 (index) |
 
-> Pricing basis: AWS S3 Standard us-east-1 — PUT $0.005/1 000 requests,
-> GET $0.0004/1 000 requests (2025).
+**Why write throughput is 181× faster?**
 
-### 4. The S3 tax — local Bitcask vs s4db
+Naive S3 makes 2000 sequential `put_object` calls - one per key.
+Each call incurs a full S3 round-trip (~50 ms),
+so 2000 writes take roughly 100 seconds of S3 wait
+time. s4db appends all 2000 keys to a single local data file and calls
+`upload()` once, issuing 2 S3 calls total - one multipart upload for the data
+file and one `put_object` for the serialized index. The network round-trip cost
+is therefore amortized across all 2000 keys instead of paid per key.
+
+**Why S3 PUT count is 1000× lower?**
+
+s4db's write path is append-local,
+upload-once: `put()` writes to a local file, and `upload()` pushes the file to
+S3 as a single object. No matter how many keys are in that batch, one data file
+→ one S3 PUT. Naive S3 has no such batching; every key is its own object.
+
+**Why read latency is similar (and s4db is slightly faster)?**
+
+Both approaches issue one S3 GET per `get()` call, so both pay the
+same ~50–60 ms network RTT. s4db uses a range request to fetch only
+the exact bytes for that entry; Naive S3 fetches the full object.
+For the 256 B values in this benchmark the objects
+are tiny, so the object-size advantage is small - but the range request still
+avoids transferring any surrounding data, giving s4db a modest edge at both
+mean and p99.
+
+**Why cost is 49× lower?**
+
+S3 API pricing is per-request. At $0.005/1000 PUTs,
+2000 PUTs cost $0.010. s4db's 2 PUTs cost effectively nothing in PUT fees;
+the $0.000210 is almost entirely the 500 GET charges. Read-request counts are
+equal, so the entire cost gap comes from write-side request reduction.
+
+> Pricing basis: AWS S3 Standard ap-south-1 - PUT $0.005/1000 requests,
+> GET $0.0004/1000 requests (2025).
+
+### 4. The S3 tax - local Bitcask vs s4db
 
 To quantify what S3 costs in latency terms, s4db's two read paths are compared
 against a minimal local Bitcask (same append-only-log + in-memory-index design,
-pure disk, no S3). 1 000 keys pre-loaded, 500 `get()` trials.
+pure disk, no S3). 1000 keys pre-loaded, 500 `get()` trials.
 
 | Metric | Local Bitcask | s4db local disk | s4db S3 range |
 | ------ | ------------- | --------------- | ------------- |
@@ -414,13 +443,13 @@ Snappy decompression and the s4db entry-format parse on top of an otherwise
 identical seek. No S3 is involved.
 
 S3 range requests (mocked) add another ~117× on top of local disk reads.
-On real S3 that gap will be larger — a typical range-request RTT is 5–50 ms,
+On real S3 that gap will be larger - a typical range-request RTT is 5–50 ms,
 versus ~0.01 ms for a local seek. The trade-off is explicit and intentional: s4db
 is designed for durable, serverless workloads where there is no local disk. When
 a local directory is available, `download()` + local reads bring latency back
 to the local-disk column.
 
-### Workload A — bulk write throughput at scale (100 000 keys, 256 B values)
+### Workload A - bulk write throughput at scale (100 000 keys, 256 B values)
 
 Pattern: `put(batch)` repeated until all keys are written, then one `upload()`.
 `batch_size=1` is omitted: each `put(1)` flushes the full index to disk, making it
@@ -429,7 +458,7 @@ O(n²) in index size at 100 k scale.
 | Batch size | keys/sec    | Elapsed     | S3 PUTs | Speedup vs batch 100 |
 | ---------: | ----------: | ----------: | ------: | -------------------: |
 | 100        | ~4 500      | ~22 282 ms  | 2       | 1×                   |
-| 1 000      | ~41 600     | ~2 403 ms   | 2       | ~9×                  |
+| 1000      | ~41 600     | ~2 403 ms   | 2       | ~9×                  |
 | 10 000     | ~114 000    | ~876 ms     | 2       | ~25×                 |
 
 S3 PUT count is constant at 2 (one data file, one index) regardless of batch size,
@@ -437,7 +466,7 @@ because `upload()` is called once at the end. The speedup is entirely from fewer
 `flush()` calls: `put()` serializes the full in-memory index to disk on every call,
 so larger batches amortize that cost across more keys.
 
-### Workload B — point read latency at scale (100 000 keys pre-loaded, 500 trials)
+### Workload B - point read latency at scale (100 000 keys pre-loaded, 500 trials)
 
 Cold condition: no local files; each `get()` issues an S3 range request.
 Warm condition: `download()` called once before trials; reads served from local disk.
@@ -449,13 +478,13 @@ Warm condition: `download()` called once before trials; reads served from local 
 | p95    | 6.061 ms        | 0.054 ms          | ~112×   |
 | p99    | 7.978 ms        | 0.186 ms          | ~43×    |
 
-At 100 000 keys the cold-read penalty grows relative to the 1 000-key case above
+At 100 000 keys the cold-read penalty grows relative to the 1000-key case above
 because the data file is larger and moto's range-request handler does proportionally
 more work. On real S3 the RTT dominates and the gap is driven by network latency,
 not file size. Calling `download()` once at invocation start amortizes that cost
 across all subsequent reads.
 
-### Workload C — mixed read/write, realistic Lambda pattern (100 000 key space)
+### Workload C - mixed read/write, realistic Lambda pattern (100 000 key space)
 
 80% reads, 20% writes, 10 000 operations total. `upload()` called once at the end
 to simulate end-of-invocation flush. Reads are served from local disk (`local_dir`

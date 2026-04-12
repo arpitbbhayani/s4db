@@ -195,7 +195,7 @@ _HDR = struct.Struct(">HI")   # 2-byte key len + 4-byte val len
 class LocalBitcask:
     """
     Minimal Bitcask-style store: append-only flat file on local disk with an
-    in-memory hash index.  No S3 involvement whatsoever — used as a baseline
+    in-memory hash index.  No S3 involvement whatsoever - used as a baseline
     to quantify the latency s4db adds by going through S3.
     """
 
@@ -236,7 +236,7 @@ class LocalBitcask:
 
 def bench_write_throughput():
     print(_separator("="))
-    print("BENCHMARK 1 — Write Throughput  (s4db batched vs unbatched)")
+    print("BENCHMARK 1 - Write Throughput  (s4db batched vs unbatched)")
     print(f"  {WRITE_TOTAL_KEYS} key/value pairs, value size ~{VALUE_SIZE} B")
     print(f"  batched: {WRITE_TOTAL_KEYS // BATCH_SIZE} calls of put({BATCH_SIZE} keys)  |  "
           f"unbatched: {WRITE_TOTAL_KEYS} calls of put(1 key)")
@@ -294,7 +294,7 @@ def bench_write_throughput():
 
 def bench_read_latency():
     print(_separator("="))
-    print("BENCHMARK 2 — Read Latency  (hot/cold distribution)")
+    print("BENCHMARK 2 - Read Latency  (hot/cold distribution)")
     print(f"  {READ_SETUP_KEYS} keys pre-loaded, {READ_TRIALS} get() trials")
     print(f"  hot set: top {int(HOT_FRACTION*100)}% of keys → "
           f"{int(HOT_SHARE*100)}% of reads  (Zipf-like)")
@@ -370,7 +370,7 @@ def bench_read_latency():
 
 def bench_vs_naive():
     print(_separator("="))
-    print("BENCHMARK 3 — s4db vs Naive S3  (head-to-head)")
+    print("BENCHMARK 3 - s4db vs Naive S3  (head-to-head)")
     print(f"  Naive S3: one put_object / get_object per key")
     print(f"  s4db:     batched put({BATCH_SIZE}) + upload()  /  range-request get()")
     print(f"  {WRITE_TOTAL_KEYS} writes, {READ_TRIALS} reads ({READ_SETUP_KEYS} key corpus)")
@@ -513,7 +513,7 @@ def bench_vs_naive():
 
 def bench_s3_tax():
     print(_separator("="))
-    print("BENCHMARK 4 — S3 Tax  (local Bitcask vs s4db)")
+    print("BENCHMARK 4 - S3 Tax  (local Bitcask vs s4db)")
     print("  Shows the latency overhead that S3 adds on top of the same")
     print("  append-only-log + in-memory-index design running purely on disk.")
     print(f"  {READ_SETUP_KEYS} keys pre-loaded, {READ_TRIALS} get() trials")
@@ -589,7 +589,7 @@ def bench_s3_tax():
     print("  Interpretation:")
     print(f"    The local disk path of s4db adds ~{disk_tax_mean:.1f}x overhead vs a pure-local")
     print(f"    Bitcask (Snappy decompression + index lookup on top of a raw seek).")
-    print(f"    S3 range requests add a further ~{s3_tax_mean / disk_tax_mean:.1f}x on top of that —")
+    print(f"    S3 range requests add a further ~{s3_tax_mean / disk_tax_mean:.1f}x on top of that -")
     print(f"    that is the S3 network/protocol tax for serverless durability.")
     print()
 
@@ -615,7 +615,7 @@ WA_BATCH_SIZES = [100, 1_000, 10_000]
 
 def bench_workload_a():
     print(_separator("="))
-    print("WORKLOAD A — Bulk Write Throughput  (batch size sweep)")
+    print("WORKLOAD A - Bulk Write Throughput  (batch size sweep)")
     print(f"  {WA_TOTAL_KEYS:,} key/value pairs, value size {WA_VALUE_SIZE} B")
     print(f"  Batch sizes tested: {WA_BATCH_SIZES}")
     print(f"  Pattern: put(batch) × (total/batch) then one upload()")
@@ -667,10 +667,10 @@ WB_TRIALS     = 500
 
 def bench_workload_b():
     print(_separator("="))
-    print("WORKLOAD B — Point Read Latency  (cold S3 range vs warm local disk)")
+    print("WORKLOAD B - Point Read Latency  (cold S3 range vs warm local disk)")
     print(f"  {WB_SETUP_KEYS:,} keys pre-loaded, {WB_TRIALS} get() trials")
-    print(f"  Cold : no local files — each get() issues an S3 range request")
-    print(f"  Warm : download() called first — reads served from local disk")
+    print(f"  Cold : no local files - each get() issues an S3 range request")
+    print(f"  Warm : download() called first - reads served from local disk")
     print(_separator())
 
     data = {_rand_str(KEY_SIZE): _rand_str(WB_VALUE_SIZE) for _ in range(WB_SETUP_KEYS)}
@@ -736,7 +736,7 @@ WC_READ_FRACTION = 0.80
 
 def bench_workload_c():
     print(_separator("="))
-    print("WORKLOAD C — Mixed Read/Write  (realistic Lambda invocation pattern)")
+    print("WORKLOAD C - Mixed Read/Write  (realistic Lambda invocation pattern)")
     print(f"  {WC_KEY_SPACE:,} key space, {WC_OPERATIONS:,} operations")
     print(f"  Mix: {int(WC_READ_FRACTION*100)}% reads / {int((1-WC_READ_FRACTION)*100)}% writes")
     print(f"  Upload() called once at the end (end-of-invocation flush pattern)")
