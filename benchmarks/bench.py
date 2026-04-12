@@ -803,13 +803,13 @@ if __name__ == "__main__":
     print(f"  hot/cold split   : top {int(HOT_FRACTION*100)}% keys get {int(HOT_SHARE*100)}% of reads")
     print()
 
-    bench_write_throughput()
-    bench_read_latency()
-    bench_vs_naive()
-    bench_s3_tax()
+    # bench_write_throughput()
+    # bench_read_latency()
+    # bench_vs_naive()
+    # bench_s3_tax()
 
-    bench_batch_write_scaling()
-    bench_cold_warm_read()
+    # bench_batch_write_scaling()
+    # bench_cold_warm_read()
     bench_mixed_rw()
 
     print("=" * 60)

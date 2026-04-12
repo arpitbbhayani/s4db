@@ -480,7 +480,7 @@ Two effects determine the shape of these numbers:
 
 Every `put()` serializes the full in-memory
 index to disk before returning. With batch size 100, that flush runs 1 000 times
-(100 000 / 100); with batch size 10 000 it runs only 10 times. Larger batches
+(100 000 / 100); with batch size 10000 it runs only 10 times. Larger batches
 amortize this O(index-size) serialization across more keys, which is why throughput
 rises with batch size.
 
@@ -489,50 +489,118 @@ rises with batch size.
 After all the `put()` calls
 finish, a single `upload()` pushes the data file and index to S3 over the network.
 On real S3 that transfer takes several seconds regardless of batch size. At batch
-100, the 1 000 flushes dominate (~17 s of disk I/O) and the upload is a small
-fraction of the total. At batch 10 000, the 10 flushes complete in under a second,
+100, the 1000 flushes dominate (~17 s of disk I/O) and the upload is a small
+fraction of the total. At batch 10000, the 10 flushes complete in under a second,
 but the upload still costs the same several seconds - it becomes the bottleneck.
 The speedup ceiling is therefore set by the ratio of (flush work saved) to
 (fixed upload cost), which on real S3 is only ~3.8× rather than the ~25× seen
 with a mocked S3 where `upload()` is effectively free.
 
-### Workload B - point read latency at scale (100 000 keys pre-loaded, 500 trials)
+### 6. Point read latency at scale (100 000 keys pre-loaded, 500 trials)
 
 Cold condition: no local files; each `get()` issues an S3 range request.
 Warm condition: `download()` called once before trials; reads served from local disk.
+All numbers are from real S3 (ap-east-1).
 
-| Metric | Cold (S3 range) | Warm (local disk) | Speedup |
-| ------ | --------------- | ----------------- | ------- |
-| mean   | 4.875 ms        | 0.027 ms          | ~179×   |
-| median | 4.625 ms        | 0.021 ms          | ~221×   |
-| p95    | 6.061 ms        | 0.054 ms          | ~112×   |
-| p99    | 7.978 ms        | 0.186 ms          | ~43×    |
+| Metric | Cold (S3 range) | Warm (local disk) | Speedup  |
+| ------ | --------------- | ----------------- | -------- |
+| mean   | 49.739 ms       | 0.009 ms          | ~5407×   |
+| median | 48.641 ms       | 0.009 ms          | ~5573×   |
+| p95    | 56.514 ms       | 0.010 ms          | ~5580×   |
+| p99    | 112.912 ms      | 0.018 ms          | ~6411×   |
+| min    | 37.858 ms       | 0.008 ms          | ~4825×   |
+| max    | 136.738 ms      | 0.121 ms          | ~1132×   |
 
-At 100 000 keys the cold-read penalty grows relative to the 1000-key case above
-because the data file is larger and moto's range-request handler does proportionally
-more work. On real S3 the RTT dominates and the gap is driven by network latency,
-not file size. Calling `download()` once at invocation start amortizes that cost
-across all subsequent reads.
+**Why cold reads are ~50 ms regardless of dataset size.**
 
-### Workload C - mixed read/write, realistic Lambda pattern (100 000 key space)
+Each cold `get()` issues an HTTP range request to S3, specifying the exact byte
+range for that entry. S3 seeks to that offset server-side and streams back only
+those bytes - it does not scan the whole file. The dominant cost is therefore
+the network round-trip to S3 (~50 ms from ap-east-1), not the size of the data
+file. The 100 000-key cold numbers are nearly identical to the 1 000-key cold
+numbers in benchmark 2: scaling the dataset by 100× has no effect on read
+latency because the range request size does not change.
 
-80% reads, 20% writes, 10 000 operations total. `upload()` called once at the end
-to simulate end-of-invocation flush. Reads are served from local disk (`local_dir`
-is set and the database was seeded before the mixed phase).
+**Why warm reads are ~0.009 ms regardless of dataset size.**
 
-| Metric              | Value       |
-| ------------------- | ----------- |
-| Total throughput    | ~128 ops/sec |
-| Read mean (p99)     | 0.048 ms (0.454 ms) |
-| Write mean (p99)    | 38.7 ms (56.8 ms)   |
-| S3 PUTs             | 2 (one data file, one index) |
+After `download()`, all data files are present locally. `get()` looks up the
+exact file number and byte offset in the in-memory index and issues a single
+`pread()` to that position - no scanning, no searching, O(1) regardless of
+how many keys are in the database. The ~0.009 ms warm latency is
+indistinguishable from the 1 000-key case in benchmark 2 for the same reason:
+the seek is to a known offset, so dataset size does not matter.
 
-Write latency dominates: every `put()` flushes the entire in-memory index (100 000
-entries) to disk before returning, which costs ~38 ms per call. In a Lambda
-invocation pattern, all writes should be batched into a single `put(batch)` +
-`upload()` at the end rather than one `put()` per key. Read latency (0.048 ms
-mean) is fast because local files are present; a cold invocation with S3 range
-requests would see ~5 ms per read as shown in Workload B.
+**Why the p99 spike reaches ~113 ms.**
+
+The cold p99 reflects S3 tail latency - occasional GETs that hit a cold shard
+or internal housekeeping on the S3 side. This is consistent with the p99 spikes
+observed in benchmarks 2 and 4 and is a known property of cloud object stores.
+The warm p99 stays at 0.018 ms because disk seeks are deterministic and
+unaffected by S3 internals.
+
+**The practical takeaway.**
+
+Calling `download()` once at startup amortizes the full S3 transfer cost across
+all subsequent reads. After that, every `get()` runs at local-disk speed - a
+~5400× improvement at this scale.
+
+### 7. Mixed read/write, realistic Lambda pattern (100000 key space)
+
+80% reads, 19% writes, 10000 operations total. `upload()` called once at the end
+to simulate end-of-invocation flush. All numbers from real S3 (ap-east-1).
+Reads are served from local disk; writes go through the full `put()` path which
+flushes the index after each call.
+
+| Metric           | Value             |
+| ---------------- | ----------------- |
+| Total ops        | 10,000 (8,000 reads + 2,000 writes) |
+| Elapsed          | 102,273 ms        |
+| Throughput       | ~98 ops/sec       |
+| S3 API calls     | `upload_file` x 1 + `put_object` x 1 |
+
+Per-operation latency breakdown:
+
+| Metric | Read latency | Write latency |
+| ------ | ------------ | ------------- |
+| mean   | 0.025 ms     | 48.631 ms     |
+| median | 0.012 ms     | 27.151 ms     |
+| p95    | 0.080 ms     | 225.625 ms    |
+| p99    | 0.096 ms     | 239.459 ms    |
+
+**Why throughput is only ~98 ops/sec despite 80% fast reads.**
+
+The total elapsed time is dominated almost entirely by write latency. With 2,000
+writes at a mean of ~48.6 ms each, the write path alone accounts for roughly
+97,000 ms of the 102,000 ms total. The 8,000 reads contribute only ~200 ms
+(8,000 × 0.025 ms). In a mixed workload the slow operation sets the pace:
+10,000 ops / 102 s = ~98 ops/sec, almost exactly what the write cost predicts.
+
+**Why each write costs ~27-48 ms when no S3 call is made.**
+
+Every `put()` serializes the entire in-memory index to disk before returning
+(`_write_entries` → `flush()` → `_save_index()`). At 100,000 entries the index
+file is large, and that full serialization runs on every single `put()` call -
+2,000 times in this benchmark. There is no S3 round-trip per write (the two S3
+calls happen only at the final `upload()`), so the cost is pure local disk I/O
+repeated 2,000 times.
+
+**Why write latency is skewed: median 27 ms but mean 48 ms and p99 239 ms.**
+
+The distribution has a long right tail. Most index flushes complete in ~27 ms,
+but roughly 1 in 20 spikes to 225+ ms. The spikes occur when the OS decides to
+flush its dirty-page cache mid-operation: the index file is written frequently
+enough that the kernel's write-back buffers fill up and a synchronous flush is
+forced, stalling the `put()` call until the underlying storage catches up. The
+mean is dragged above the median by these infrequent but expensive stalls.
+
+**The practical Lambda takeaway.**
+
+In a Lambda invocation pattern, the correct approach is to batch all writes into
+a single `put(batch)` + `upload()` at the end rather than calling `put()` once
+per key. One batch call flushes the index once; 2,000 individual calls flush it
+2,000 times. Read latency (0.025 ms mean) is fast because local files are
+present from a prior `download()`. A cold invocation with no local files would
+pay ~50 ms per read via S3 range requests, as shown in benchmark 6.
 
 ## Dependencies
 
