@@ -37,6 +37,30 @@ print(db.get("hello"))  # None
 
 On `__init__`, the index is downloaded from S3 into memory. If no index exists, the database starts empty. No local directory is created or used until a write operation (`put` / `delete`) is called.
 
+## When to use s4db
+
+s4db fits workloads that need durable key-value semantics on ephemeral compute - without a running database.
+
+**Good fits**
+- **Lambda / serverless state** - load index on cold start (~50 ms S3 RTT), mutate in memory, `upload()` once before return. No VPC, no connections.
+- **Batch pipeline checkpoints** - write processed keys as you go, `upload()` periodically. Restart resumes from the existing index.
+- **Read-heavy config / lookup tables** - write once, `download()` on each worker at startup, all reads from local disk at ~0.009 ms.
+- **ETL joins** - pre-load a lookup table into s4db, upload to S3, workers download at startup. ~0.009 ms median lookup vs ~50 ms per S3 GET.
+- **Experiment tracking** - log metrics and artefacts to s4db, sync to S3 at end of run. Queryable by key from any machine.
+
+**Not a fit** - key space doesn't fit in RAM, range queries needed, concurrent writers on the same prefix, or sub-ms reads without a warm local copy.
+
+**Key numbers** (real S3, ap-south-1 / ap-east-1):
+
+| Operation | Latency / throughput |
+| --------- | -------------------- |
+| `get()` - local disk | ~0.009 ms median |
+| `get()` - S3 range request | ~49 ms median, ~113 ms p99 |
+| `put()` batched (1000 keys/call) | ~12 769 keys/sec |
+| s4db vs naive one-object-per-key writes | **181x faster, 1000x fewer PUTs, 49x cheaper** |
+
+Full numbers in [Benchmarks](docs/benchmarks.md).
+
 ## S3 layout
 
 Given `bucket="my-bucket"` and `prefix="my-db/"`:
