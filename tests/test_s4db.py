@@ -16,6 +16,7 @@ from s4db._format import (
     stream_file_entries,
     HEADER_SIZE,
     FLAG_NORMAL,
+    FLAG_NOCOMPRESS,
     FLAG_TOMBSTONE,
 )
 from s4db._index import Index, IndexEntry
@@ -66,7 +67,7 @@ class TestFileHeader:
         data = pack_file_header(42)
         assert len(data) == HEADER_SIZE
         version, file_num = unpack_file_header(data)
-        assert version == 0x01
+        assert version == 0x02
         assert file_num == 42
 
     def test_bad_magic(self):
@@ -81,7 +82,7 @@ class TestEntry:
         key, value, flags, length = unpack_entry_at(packed)
         assert key == "hello"
         assert value == "world"
-        assert flags == FLAG_NORMAL
+        assert not flags & FLAG_TOMBSTONE
         assert length == len(packed)
 
     def test_tombstone_entry_roundtrip(self):
@@ -121,7 +122,7 @@ class TestStreamEntries:
         assert len(results) == 3
         for i, (offset, raw, key, flags) in enumerate(results):
             assert key == pairs[i][0]
-            assert flags == FLAG_NORMAL
+            assert not flags & FLAG_TOMBSTONE
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +135,7 @@ class TestIndex:
         idx = Index()
         idx.put("k1", 1, 9, 50)
         e = idx.get("k1")
-        assert e.file_num == 1
+        assert e.file_id == 1
         assert e.offset == 9
         assert e.length == 50
 
@@ -152,8 +153,8 @@ class TestIndex:
         raw = idx.to_bytes()
         idx2 = Index.from_bytes(raw)
         assert idx2.next_file_num == 5
-        assert idx2.get("a") == IndexEntry(file_num=2, offset=9, length=30)
-        assert idx2.get("b") == IndexEntry(file_num=3, offset=40, length=25)
+        assert idx2.get("a") == IndexEntry(file_id=2, offset=9, length=30)
+        assert idx2.get("b") == IndexEntry(file_id=3, offset=40, length=25)
 
     def test_missing_key_returns_none(self):
         idx = Index()
@@ -266,6 +267,7 @@ class TestCompaction:
     def test_compact_removes_old_files(self, db):
         db.put({"a": "1", "b": "2"})
         db.put({"a": "updated"})
+        db.upload()
         old_files = sorted(_glob.glob(os.path.join(db.local_dir, "data_*.s4db")))
         assert len(old_files) >= 1
         db.compact()
@@ -277,6 +279,7 @@ class TestCompaction:
         db.put({"a": "old_a", "b": "old_b"})
         db.put({"a": "new_a"})
         db.delete(["b"])
+        db.upload()
         db.compact()
         assert db.get("a") == "new_a"
         assert db.get("b") is None
@@ -284,6 +287,7 @@ class TestCompaction:
     def test_compact_skips_tombstones(self, db):
         db.put({"x": "val"})
         db.delete(["x"])
+        db.upload()
         db.compact()
         assert db.get("x") is None
         # After compaction there should be no data files (all tombstoned)
@@ -293,6 +297,7 @@ class TestCompaction:
     def test_compact_preserves_all_live_keys(self, db):
         data = {f"key{i}": f"value{i}" for i in range(20)}
         db.put(data)
+        db.upload()
         db.compact()
         for k, v in data.items():
             assert db.get(k) == v
@@ -306,10 +311,12 @@ class TestRebuildIndex:
         db.rebuild_index()
         assert db._index.entries == original_entries
 
-    def test_rebuild_index_updates_next_file_num(self, db):
+    def test_rebuild_index_keeps_entries_readable(self, db):
         db.put({"k": "v"})
         db.rebuild_index()
-        assert db._index.next_file_num > 1
+        assert db.get("k") == "v"
+        # Namespaced files do not advance the legacy writer-0 counter
+        assert db._index.next_file_num == 1
 
     def test_rebuild_empty_db(self, db):
         db.rebuild_index()
@@ -330,20 +337,26 @@ class TestContextManager:
 
 
 class TestIndexPersistence:
-    def test_index_persisted_after_put(self, db):
+    def test_put_does_not_write_local_index(self, db):
+        # The per-put local index flush was removed: recovery never read it.
         db.put({"persist": "me"})
+        assert not os.path.exists(os.path.join(db.local_dir, "index.idx"))
+
+    def test_flush_writes_local_index_snapshot(self, db):
+        db.put({"persist": "me"})
+        db.flush()
         local_index = os.path.join(db.local_dir, "index.idx")
         with open(local_index, "rb") as fh:
             idx = Index.from_bytes(fh.read())
         assert idx.get("persist") is not None
 
-    def test_next_file_num_increments(self, db):
-        assert db._index.next_file_num == 1
+    def test_seq_increments_on_roll_only(self, db):
+        assert db._seq == 0
         db.put({"k": "v"})
-        assert db._index.next_file_num == 2
-        # Second put appends to the existing file (still has room), so next_file_num stays 2
+        assert db._seq == 1
+        # Second put appends to the existing file (still has room), so no new file
         db.put({"k2": "v2"})
-        assert db._index.next_file_num == 2
+        assert db._seq == 1
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +468,7 @@ class TestIndexEdgeCases:
         idx.put("k", 1, 9, 10)
         idx.put("k", 2, 50, 30)
         e = idx.get("k")
-        assert e.file_num == 2
+        assert e.file_id == 2
         assert e.offset == 50
 
 
@@ -481,8 +494,8 @@ class TestStreamEntriesEdgeCases:
         keys = {key for _, _, key, _ in results}
         assert keys == {"alive", "dead"}
         flags_map = {key: flags for _, _, key, flags in results}
-        assert flags_map["alive"] == FLAG_NORMAL
-        assert flags_map["dead"] == FLAG_TOMBSTONE
+        assert not flags_map["alive"] & FLAG_TOMBSTONE
+        assert flags_map["dead"] & FLAG_TOMBSTONE
 
 
 # ---------------------------------------------------------------------------
@@ -529,6 +542,7 @@ class TestCompactEdgeCases:
         )
         data = {f"k{i}": "value" * 5 for i in range(10)}
         db.put(data)
+        db.upload()
         db.compact()
         # All keys survive compaction regardless of how many files were produced
         for k, v in data.items():
@@ -540,6 +554,7 @@ class TestCompactEdgeCases:
         old_files = {obj["Key"] for obj in s3.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX).get("Contents", [])}
 
         db.put({"a": "2"})  # creates a second version; first file is now stale
+        db.upload()
         db.compact()
 
         new_files = {obj["Key"] for obj in s3.list_objects_v2(Bucket=BUCKET, Prefix=PREFIX).get("Contents", [])}
@@ -699,7 +714,7 @@ class TestIterLocal:
         fresh_dir.mkdir()
         db2 = S4DB(local_dir=str(fresh_dir), bucket=BUCKET, prefix=PREFIX, region_name="us-east-1")
         # Pre-populate the local file with db2's data (simulate already-present file)
-        db2.iter(local=True)  # first call downloads the file
+        list(db2.iter(local=True))  # first call downloads the file
         data_files = _glob.glob(os.path.join(str(fresh_dir), "data_*.s4db"))
         assert len(data_files) == 1
         mtime_before = os.path.getmtime(data_files[0])

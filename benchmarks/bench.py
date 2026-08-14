@@ -10,6 +10,7 @@ Benchmarks for s4db.
   5. Bulk Write Scaling     -- write throughput as a function of batch size
   6. Cold vs Warm Read      -- S3 range request latency vs local disk after download()
   7. Mixed Read/Write       -- 80/20 read/write mix, end-of-invocation flush pattern
+  8. Open Cost              -- S4DB open time (index GET + deserialize) vs database size
 
 Requires real AWS credentials and an S3 bucket (set BUCKET / PREFIX / REGION below).
 Run with:
@@ -789,6 +790,65 @@ def bench_mixed_rw():
 
 
 # ---------------------------------------------------------------------------
+# Benchmark 8 – Open cost (index GET + deserialize) vs database size
+# ---------------------------------------------------------------------------
+
+OPEN_SIZES = [1_000, 100_000, 1_000_000]
+OPEN_TRIALS = 20
+OPEN_BUILD_BATCH = 10_000
+
+
+def bench_open_cost():
+    """Times S4DB open (one index GET + deserialize) as a function of database size.
+
+    This is the fixed cost every fresh process -- the serverless pattern s4db
+    targets -- pays before its first read. Corpora are built once under
+    size-specific prefixes and reused on later runs. Note the data transfer:
+    20 opens at 10^6 keys move ~38 MB of index each, ~$0.07 of egress when the
+    client is outside AWS.
+    """
+    print("=" * 60)
+    print("BENCHMARK 8 - Open cost (index GET) vs database size")
+    print(f"  {OPEN_TRIALS} timed opens per size, fresh local_dir each open")
+
+    results = {"region": REGION, "sizes": {}}
+    for n_keys in OPEN_SIZES:
+        prefix = f"{PREFIX.rstrip('/')}-open-{n_keys}/"
+
+        # Build the corpus once; reuse it on subsequent runs.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = S4DB(bucket=BUCKET, prefix=prefix, local_dir=tmpdir, region_name=REGION)
+            if len(db) < n_keys:
+                print(f"  building corpus: {n_keys:,} keys under {prefix} ...")
+                data = _make_kv(n_keys)
+                keys_list = list(data.keys())
+                for i in range(0, n_keys, OPEN_BUILD_BATCH):
+                    db.put({k: data[k] for k in keys_list[i:i + OPEN_BUILD_BATCH]})
+                db.upload()
+
+        # One untimed warmup open absorbs boto3 session/connection setup.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            S4DB(bucket=BUCKET, prefix=prefix, local_dir=tmpdir, region_name=REGION)
+
+        lats = []
+        for _ in range(OPEN_TRIALS):
+            with tempfile.TemporaryDirectory() as tmpdir:
+                t0 = time.perf_counter()
+                S4DB(bucket=BUCKET, prefix=prefix, local_dir=tmpdir, region_name=REGION)
+                lats.append((time.perf_counter() - t0) * 1000)
+
+        st = _stats(lats)
+        index_mb = 38 * n_keys / 1e6  # v2 index: ~38 B/entry at 16-B keys
+        print(f"  {n_keys:>9,} keys (~{index_mb:6.1f} MB index): "
+              f"mean {st['mean']:8.1f} ms  median {st['median']:8.1f} ms  "
+              f"p95 {st['p95']:8.1f} ms  p99 {st['p99']:8.1f} ms")
+        results["sizes"][n_keys] = {"index_mb": index_mb, **st}
+
+    print()
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -810,6 +870,7 @@ if __name__ == "__main__":
 
     # bench_batch_write_scaling()
     # bench_cold_warm_read()
+    # bench_open_cost()
     bench_mixed_rw()
 
     print("=" * 60)

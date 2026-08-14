@@ -1,6 +1,6 @@
 # s4db - Simple DB on S3
 
-A lightweight embedded key-value store where keys and values are strings. Data is written to numbered binary files on disk and synced to S3. Values are Snappy-compressed. An in-memory index tracks the exact file and byte offset for every live key, so reads never scan - they seek directly.
+A lightweight embedded key-value store where keys are strings and values are strings or bytes. Data is written to numbered binary files on disk and synced to S3. Values are Snappy-compressed when compression helps. An in-memory index tracks the exact file and byte offset for every live key, so reads never scan - they seek directly. Concurrent writers are safe: each writer's files live in their own namespace, and index commits are compare-and-swapped (per-key last-writer-wins).
 
 ## Installation
 
@@ -48,7 +48,7 @@ s4db fits workloads that need durable key-value semantics on ephemeral compute -
 - **ETL joins** - pre-load a lookup table into s4db, upload to S3, workers download at startup. ~0.009 ms median lookup vs ~50 ms per S3 GET.
 - **Experiment tracking** - log metrics and artefacts to s4db, sync to S3 at end of run. Queryable by key from any machine.
 
-**Not a fit** - key space doesn't fit in RAM, range queries needed, concurrent writers on the same prefix, or sub-ms reads without a warm local copy.
+**Not a fit** - key space doesn't fit in RAM, range queries needed, cross-key transactions, or sub-ms reads without a warm local copy. Concurrent writers on one prefix are supported since 0.9.0 (writer-namespaced files + compare-and-swap index commits with per-key last-writer-wins), but if you need transactional multi-writer semantics, use a database.
 
 **Key numbers** (real S3, ap-south-1 / ap-east-1):
 
@@ -74,7 +74,7 @@ my-bucket/
     ...
 ```
 
-Data files are named `data_NNNNNN.s4db` with zero-padded six-digit sequence numbers. The index file is always `index.idx`.
+Data files are named `data_XXXXXXXX_NNNNNN.s4db` - an 8-hex-digit writer namespace plus a zero-padded sequence number (legacy `data_NNNNNN.s4db` files from pre-0.9 databases remain readable). The index file is always `index.idx`.
 
 
 ## Typical workflows
@@ -139,9 +139,8 @@ db.compact()    # rewrite, clean up S3, upload new files
 
 ```python
 db = S4DB("my-bucket", "my-db/", local_dir="/tmp/my-db")
-db.download()       # pull all data files
-db.rebuild_index()  # reconstruct index from data files
-db.upload()         # push repaired index to S3
+db.rebuild_index(from_s3=True)  # download data files (no index needed) and replay them
+db.upload()                     # push repaired index (and any orphaned files) to S3
 ```
 
 ## Documentation
